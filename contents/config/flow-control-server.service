@@ -1,0 +1,17 @@
+[Unit]
+Description=Flow Control System Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uvr
+WorkingDirectory=/home/uvr/Flow-Control-System-Server
+ExecStart=/usr/bin/python3 -u /home/uvr/Flow-Control-System-Server/contents/code/main.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

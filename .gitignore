@@ -82,3 +82,7 @@ CMakeLists.txt.user*
 .uic/
 /build*/
 /.qtcreator/
+
+# SSH password files
+password.txt
+**/password.txt
