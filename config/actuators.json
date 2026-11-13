@@ -1,0 +1,85 @@
+{
+    "actuators": [
+        {
+            "id": "N2OV",
+            "label": "N2O Valve (N2OV)",
+            "type": "servo",
+            "normal_state": "CLOSED",
+            "states": [
+                "OPEN",
+                "CLOSED"
+            ],
+            "hint": "2 LS",
+            "key": "1"
+        },
+        {
+            "id": "DUMP",
+            "label": "Dump Valve (DUMP)",
+            "type": "servo",
+            "normal_state": "OPEN",
+            "states": [
+                "OPEN",
+                "CLOSED"
+            ],
+            "hint": "2 LS",
+            "key": "2"
+        },
+        {
+            "id": "RTV",
+            "label": "Run Tank 3-Way Solenoid (RTV)",
+            "type": "solenoid_3way",
+            "normal_state": "CLOSED",
+            "states": [
+                "FILL",
+                "CLOSED",
+                "VENT"
+            ],
+            "hint": "3 LS",
+            "key": "3"
+        },
+        {
+            "id": "QD",
+            "label": "Quick Disconnect Solenoid (QD)",
+            "type": "solenoid_qd",
+            "normal_state": "CONNECTED",
+            "states": [
+                "CONNECTED",
+                "DISCONNECTED"
+            ],
+            "hint": "No LS",
+            "single_use": true,
+            "requires_confirm": true,
+            "key": "4"
+        },
+        {
+            "id": "MEV",
+            "label": "Main Engine E-Match (MEV)",
+            "type": "ematch",
+            "normal_state": "READY",
+            "states": [
+                "READY",
+                "FIRED"
+            ],
+            "hint": "No LS • 1-Use",
+            "single_use": true,
+            "requires_confirm": true,
+            "external": false,
+            "key": "5"
+        },
+        {
+            "id": "MRV",
+            "label": "MRV E-Match (TBD)",
+            "type": "ematch",
+            "normal_state": "READY",
+            "states": [
+                "READY",
+                "FIRED"
+            ],
+            "hint": "External / TBD",
+            "single_use": true,
+            "requires_confirm": true,
+            "external": true,
+            "key": ""
+        }
+    ]
+}
