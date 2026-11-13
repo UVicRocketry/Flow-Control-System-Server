@@ -1,0 +1,17 @@
+[Unit]
+Description=Flow Control Direct Ethernet Detector (Fallback IP when no router is present)
+After=network.target NetworkManager.service systemd-networkd.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/uvr/Flow-Control-System-Server
+ExecStart=/bin/bash /home/uvr/Flow-Control-System-Server/contents/code/direct-eth-detect.sh --watch
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

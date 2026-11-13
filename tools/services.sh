@@ -64,6 +64,7 @@ SSH_OPTS=(
     -o GSSAPIAuthentication=no
     -o PreferredAuthentications=password,keyboard-interactive
     -o PubkeyAuthentication=no
+    -o ConnectTimeout=5
     -o ControlMaster=auto
     -o ControlPath="${CTL_DIR}/mux"
     -o ControlPersist=60
@@ -87,6 +88,28 @@ run_remote_sudo() {
     run_ssh "printf '%s\n' ${escaped_pw} | sudo -S -p '' $*"
 }
 
+check_tcp_port() {
+    local host="$1"
+    local port="$2"
+    if command -v nc >/dev/null 2>&1; then
+        nc -z -w 2 "${host}" "${port}" >/dev/null 2>&1
+    else
+        timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
+    fi
+}
+
+is_valve_cart_reachable() {
+    check_tcp_port "${REMOTE_HOST}" "${REMOTE_PORT}" && run_ssh "true" >/dev/null 2>&1
+}
+
+require_connection() {
+    if ! is_valve_cart_reachable; then
+        echo "Error: Cannot connect to valve cart at ${REMOTE_TARGET} (port ${REMOTE_PORT})." >&2
+        echo "Ensure the valve cart is powered on and reachable (or run tools/direct-ethernet.sh if connected directly)." >&2
+        return 1
+    fi
+}
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [COMMAND]
@@ -102,6 +125,7 @@ Commands:
   logs [-f]         Show recent journald logs (pass -f to follow live)
   enable            Enable the service to autostart at boot
   disable           Disable the service from autostarting at boot
+  direct-eth [args] Open or forward commands to tools/direct-ethernet.sh
   help              Show this help message
 EOF
 }
@@ -156,33 +180,96 @@ do_disable() {
 }
 
 interactive_menu() {
-    echo "=========================================="
-    echo " Service Manager: ${SERVICE_NAME} (${REMOTE_TARGET})"
-    echo "=========================================="
-    echo "1) Check status & journald logs"
-    echo "2) Follow live journald logs (journalctl -f)"
-    echo "3) Restart service"
-    echo "4) Enable service (autostart at boot)"
-    echo "5) Disable service"
-    echo "6) Start service"
-    echo "7) Stop service"
-    echo "q) Quit"
-    echo "------------------------------------------"
-    read -r -p "Select an option [1-7, q]: " choice
-    case "${choice}" in
-        1) do_status ;;
-        2) do_logs "-f" ;;
-        3) do_restart ;;
-        4) do_enable ;;
-        5) do_disable ;;
-        6) do_start ;;
-        7) do_stop ;;
-        q|Q) exit 0 ;;
-        *)
-            echo "Invalid selection: ${choice}" >&2
-            exit 1
-            ;;
-    esac
+    while true; do
+        local connected=0
+        local conn_label="DISCONNECTED (unreachable)"
+        if is_valve_cart_reachable; then
+            connected=1
+            conn_label="CONNECTED"
+        fi
+
+        echo ""
+        echo "=========================================="
+        echo " Service Manager: ${SERVICE_NAME} (${REMOTE_TARGET})"
+        echo " Connection: ${conn_label}"
+        echo "=========================================="
+        if [[ "${connected}" == "1" ]]; then
+            echo "1) Check status & journald logs"
+            echo "2) Follow live journald logs (journalctl -f)"
+            echo "3) Restart service"
+            echo "4) Enable service (autostart at boot)"
+            echo "5) Disable service"
+            echo "6) Start service"
+            echo "7) Stop service"
+        else
+            echo " [!] Valve cart is unreachable. Remote actions are disabled."
+        fi
+        echo "d) Direct Ethernet manager"
+        echo "r) Re-check connection"
+        echo "q) Quit"
+        echo "------------------------------------------"
+        if [[ "${connected}" == "1" ]]; then
+            read -r -p "Select an option [1-7, d, r, q]: " choice
+        else
+            read -r -p "Select an option [d, r, q]: " choice
+        fi
+
+        case "${choice}" in
+            d|D)
+                set +e
+                "${SCRIPT_DIR}/direct-ethernet.sh"
+                local d_rc=$?
+                set -e
+                if [[ ${d_rc} -ne 0 && ${d_rc} -ne 130 ]]; then
+                    echo "Direct Ethernet manager exited with status ${d_rc}." >&2
+                fi
+                echo ""
+                read -r -p "Press Enter to return to the main menu..." _
+                continue
+                ;;
+            r|R)
+                continue
+                ;;
+            q|Q)
+                exit 0
+                ;;
+            1|2|3|4|5|6|7)
+                if [[ "${connected}" != "1" ]]; then
+                    echo "Error: Not connected to valve cart (${REMOTE_TARGET}). Cannot perform this action." >&2
+                    echo ""
+                    read -r -p "Press Enter to return to the main menu..." _
+                    continue
+                fi
+                ;;
+            *)
+                echo "Invalid selection: ${choice}" >&2
+                continue
+                ;;
+        esac
+
+        set +e
+        case "${choice}" in
+            1) do_status ;;
+            2)
+                trap ':' INT
+                do_logs "-f"
+                trap - INT
+                ;;
+            3) do_restart ;;
+            4) do_enable ;;
+            5) do_disable ;;
+            6) do_start ;;
+            7) do_stop ;;
+        esac
+        local rc=$?
+        set -e
+
+        if [[ ${rc} -ne 0 && ${rc} -ne 130 ]]; then
+            echo "Command exited with status ${rc}." >&2
+        fi
+        echo ""
+        read -r -p "Press Enter to return to the main menu..." _
+    done
 }
 
 COMMAND="${1:-}"
@@ -194,28 +281,39 @@ fi
 shift || true
 case "${COMMAND}" in
     status)
+        require_connection
         do_status
         ;;
     restart)
+        require_connection
         do_restart
         ;;
     start)
+        require_connection
         do_start
         ;;
     stop)
+        require_connection
         do_stop
         ;;
     logs|journal|journald)
+        require_connection
         do_logs "${1:-}"
         ;;
     follow|-f)
+        require_connection
         do_logs "-f"
         ;;
     enable)
+        require_connection
         do_enable
         ;;
     disable)
+        require_connection
         do_disable
+        ;;
+    direct-eth|--direct-eth|direct-ethernet)
+        "${SCRIPT_DIR}/direct-ethernet.sh" "$@"
         ;;
     -h|--help|help)
         usage
