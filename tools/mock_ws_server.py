@@ -22,7 +22,7 @@ from pathlib import Path
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ACTUATORS_CONFIG = REPO_ROOT / "config" / "actuators.json"
+ACTUATORS_CONFIG = REPO_ROOT / "contents" / "config" / "actuators.json"
 
 
 def load_actuators_config() -> list[dict]:
