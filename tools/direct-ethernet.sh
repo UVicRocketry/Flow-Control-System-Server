@@ -79,7 +79,7 @@ EOF
 ssh_opts() {
     local opts=(
         -4
-        -p "${REMOTE_PORT}"
+        -o "Port=${REMOTE_PORT}"
         -o StrictHostKeyChecking=accept-new
         -o GSSAPIAuthentication=no
         -o PreferredAuthentications=password,keyboard-interactive

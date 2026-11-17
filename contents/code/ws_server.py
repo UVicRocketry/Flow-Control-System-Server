@@ -723,6 +723,8 @@ class FlowControlWSServer:
             await self.send_to(client, self._build_remote_data_list_payload())
         elif operation == "get":
             await self._remote_get(client, msg)
+        elif operation in ("put", "upload"):
+            await self._remote_put(client, msg)
         elif operation == "rename":
             await self._remote_rename(client, msg)
         elif operation == "delete":
@@ -788,6 +790,72 @@ class FlowControlWSServer:
                 self._recording_file.flush()
             except Exception:
                 pass
+
+    async def _remote_put(self, client: Any, msg: dict[str, Any]) -> None:
+        """Store an uploaded CSV/JSONL telemetry file in self.data_dir."""
+        filename = sanitize_filename(str(msg.get("filename") or ""))
+        if not filename:
+            await self.send_alert(
+                "ERR",
+                "Upload failed: invalid filename.",
+                client=client,
+            )
+            return
+
+        if Path(filename).suffix == "":
+            filename = f"{filename}.csv"
+        elif Path(filename).suffix.lower() not in (".csv", ".jsonl"):
+            await self.send_alert(
+                "ERR",
+                f"Upload failed: unsupported file type for {filename}.",
+                client=client,
+            )
+            return
+
+        content = msg.get("content")
+        if not isinstance(content, str):
+            await self.send_alert(
+                "ERR",
+                "Upload failed: missing or invalid file content.",
+                client=client,
+            )
+            return
+
+        if self._recording_active and self._recording_filename == filename:
+            await self.send_alert(
+                "ERR",
+                f"Upload failed: {filename} is currently being recorded.",
+                client=client,
+            )
+            return
+
+        target = self.data_dir / filename
+        overwrote = target.exists()
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            logger.info(
+                "Stored uploaded remote file: %s (%d bytes, overwrote=%s)",
+                filename,
+                len(content.encode("utf-8")),
+                overwrote,
+            )
+        except Exception as exc:
+            logger.error("Failed storing uploaded file %s: %s", target, exc)
+            await self.send_alert(
+                "ERR",
+                f"Failed to store {filename} on valve cart: {exc}",
+                client=client,
+            )
+            return
+
+        await self.broadcast(self._build_remote_data_list_payload())
+        suffix = " (overwrote existing)" if overwrote else ""
+        await self.send_alert(
+            "INFO",
+            f'Stored "{filename}" on the valve cart{suffix}.',
+            client=client,
+        )
 
     async def _remote_rename(self, client: Any, msg: dict[str, Any]) -> None:
         old_name = sanitize_filename(str(msg.get("old_name") or ""))
@@ -988,7 +1056,10 @@ class FlowControlWSServer:
 
         try:
             async with _ws_serve(
-                self._ws_client_handler, self.host, self.port
+                self._ws_client_handler,
+                self.host,
+                self.port,
+                max_size=16 * 1024 * 1024,
             ):
                 await self._stop_event.wait()
         finally:
