@@ -214,9 +214,7 @@ class FlowControlWSServer:
     def reload_actuators_config(self) -> None:
         """Load actuator definitions from actuators.json and init states."""
         if not self.config_path.exists():
-            logger.warning(
-                "Actuators config not found at %s", self.config_path
-            )
+            logger.warning("Actuators config not found at %s", self.config_path)
             self.actuators = []
         else:
             try:
@@ -388,12 +386,8 @@ class FlowControlWSServer:
             if isinstance(msg, dict):
                 await self._dispatch_message(client, msg)
 
-    async def _dispatch_message(
-        self, client: Any, msg: dict[str, Any]
-    ) -> None:
-        msg_type = (
-            str(msg.get("type") or msg.get("identifier") or "").strip().lower()
-        )
+    async def _dispatch_message(self, client: Any, msg: dict[str, Any]) -> None:
+        msg_type = str(msg.get("type") or msg.get("identifier") or "").strip().lower()
         cmd = str(msg.get("command") or "").strip().upper()
 
         if msg_type == "abort" or cmd == "ABORT":
@@ -430,8 +424,7 @@ class FlowControlWSServer:
             )
             await self.send_alert(
                 "WARN",
-                f"Actuation blocked ({valve} -> {action}): "
-                "System is in SAFE mode.",
+                f"Actuation blocked ({valve} -> {action}): System is in SAFE mode.",
                 client=client,
             )
             return False
@@ -467,9 +460,7 @@ class FlowControlWSServer:
 
         return True
 
-    async def _handle_valve_command(
-        self, client: Any, msg: dict[str, Any]
-    ) -> None:
+    async def _handle_valve_command(self, client: Any, msg: dict[str, Any]) -> None:
         valve = str(msg.get("valve") or "").strip().upper()
         action = str(msg.get("action") or "").strip().upper()
 
@@ -487,9 +478,7 @@ class FlowControlWSServer:
         logger.info("Executing command: valve=%s, action=%s", valve, action)
 
         if self.serial_controller is not None:
-            send_fn = getattr(
-                self.serial_controller, "send_valve_command", None
-            )
+            send_fn = getattr(self.serial_controller, "send_valve_command", None)
             if send_fn is not None:
                 res = send_fn(valve, action)
                 if inspect.isawaitable(res):
@@ -518,9 +507,7 @@ class FlowControlWSServer:
             "EMERGENCY ABORT requested, but no controller is attached!",
         )
 
-    async def _handle_unabort(
-        self, _client: Any, _msg: dict[str, Any]
-    ) -> None:
+    async def _handle_unabort(self, _client: Any, _msg: dict[str, Any]) -> None:
         logger.info("Clearing abort lockout (UNABORT)")
         if self.serial_controller is not None:
             unabort_fn = getattr(self.serial_controller, "send_unabort", None)
@@ -532,22 +519,16 @@ class FlowControlWSServer:
 
         await self.send_alert("INFO", "Valve Cart abort state cleared.")
 
-    async def _handle_summary(
-        self, _client: Any, _msg: dict[str, Any]
-    ) -> None:
+    async def _handle_summary(self, _client: Any, _msg: dict[str, Any]) -> None:
         if self.serial_controller is not None:
-            summary_fn = getattr(
-                self.serial_controller, "request_summary", None
-            )
+            summary_fn = getattr(self.serial_controller, "request_summary", None)
             if summary_fn is not None:
                 res = summary_fn()
                 if inspect.isawaitable(res):
                     await res
                 return
 
-        await self.broadcast(
-            {"type": "summary", "valves": dict(self.valve_states)}
-        )
+        await self.broadcast({"type": "summary", "valves": dict(self.valve_states)})
 
     async def _handle_armed_request(
         self, _client: Any, msg: dict[str, Any], msg_type: str, cmd: str
@@ -588,9 +569,7 @@ class FlowControlWSServer:
         else:
             await self._stop_recording_session()
 
-    async def _start_recording_session(
-        self, client: Any, raw_name: str
-    ) -> None:
+    async def _start_recording_session(self, client: Any, raw_name: str) -> None:
         filename = sanitize_filename(raw_name)
         if not filename:
             await self.send_alert(
@@ -613,9 +592,7 @@ class FlowControlWSServer:
             self._stop_builtin_recording()
 
         self._start_builtin_recording(filename)
-        await self.send_alert(
-            "INFO", f"Server telemetry recording started: {filename}"
-        )
+        await self.send_alert("INFO", f"Server telemetry recording started: {filename}")
 
     async def _stop_recording_session(self) -> None:
         if not self._recording_active:
@@ -631,9 +608,7 @@ class FlowControlWSServer:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         filepath = self.data_dir / filename
         exists_nonempty = filepath.exists() and filepath.stat().st_size > 0
-        self._recording_file = open(
-            filepath, "a", encoding="utf-8", buffering=1
-        )
+        self._recording_file = open(filepath, "a", encoding="utf-8", buffering=1)
         if not exists_nonempty:
             self._recording_file.write(CSV_UNITS_ROW + "\n")
             self._recording_file.write(CSV_CHANNELS_ROW + "\n")
@@ -706,9 +681,7 @@ class FlowControlWSServer:
             "files": self._list_data_files(),
         }
 
-    async def _handle_remote_data_req(
-        self, client: Any, msg: dict[str, Any]
-    ) -> None:
+    async def _handle_remote_data_req(self, client: Any, msg: dict[str, Any]) -> None:
         """Handle client `remote_data_req` operations (list/get/rename/del)."""
         if self.data_recorder is not None and hasattr(
             self.data_recorder, "handle_remote_request"
@@ -891,12 +864,8 @@ class FlowControlWSServer:
                 self._recording_filename = new_name
             logger.info("Renamed remote file %s -> %s", old_name, new_name)
         except Exception as exc:
-            logger.error(
-                "Rename failed %s -> %s: %s", old_name, new_name, exc
-            )
-            await self.send_alert(
-                "ERR", f"Rename failed: {exc}", client=client
-            )
+            logger.error("Rename failed %s -> %s: %s", old_name, new_name, exc)
+            await self.send_alert("ERR", f"Rename failed: {exc}", client=client)
             return
 
         await self.broadcast(self._build_remote_data_list_payload())
@@ -915,9 +884,7 @@ class FlowControlWSServer:
                 target.unlink()
                 logger.info("Deleted remote data file: %s", filename)
             else:
-                logger.debug(
-                    "Delete skipped for missing file %s", filename
-                )
+                logger.debug("Delete skipped for missing file %s", filename)
         except Exception as exc:
             logger.error("Failed deleting %s: %s", filename, exc)
             await self.send_alert(
@@ -936,9 +903,7 @@ class FlowControlWSServer:
         return str(addr) if addr else repr(client)
 
     @staticmethod
-    def _extract_request_path(
-        client: Any, legacy_path: str | None = None
-    ) -> str:
+    def _extract_request_path(client: Any, legacy_path: str | None = None) -> str:
         if legacy_path:
             return legacy_path
         req = getattr(client, "request", None)
@@ -970,9 +935,7 @@ class FlowControlWSServer:
         except _WSConnectionClosed:
             pass
         except Exception as exc:
-            logger.error(
-                "Unexpected error in client handler (%s): %s", label, exc
-            )
+            logger.error("Unexpected error in client handler (%s): %s", label, exc)
         finally:
             self.clients.discard(client)
             logger.info(
@@ -1046,8 +1009,7 @@ class FlowControlWSServer:
             )
 
         logger.info(
-            "Starting FlowControlWSServer on ws://%s:%d/ws "
-            "(armed=%s, actuators=%d)",
+            "Starting FlowControlWSServer on ws://%s:%d/ws (armed=%s, actuators=%d)",
             self.host,
             self.port,
             self.armed,
@@ -1071,9 +1033,7 @@ class FlowControlWSServer:
             if not task.done():
                 task.cancel()
         if self._background_tasks:
-            await asyncio.gather(
-                *self._background_tasks, return_exceptions=True
-            )
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
 
         if self._recording_active:
