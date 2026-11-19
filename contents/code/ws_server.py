@@ -29,6 +29,8 @@ from typing import Any
 try:
     from websockets.asyncio.server import (  # type: ignore
         broadcast as _ws_broadcast,
+    )
+    from websockets.asyncio.server import (  # type: ignore
         serve as _ws_serve,
     )
     from websockets.exceptions import (  # type: ignore
