@@ -50,7 +50,7 @@ DEFAULT_ACTUATORS_CONFIG = REPO_ROOT / "contents" / "config" / "actuators.json"
 DEFAULT_DATA_DIR = REPO_ROOT / "data"
 
 # Two-row CSV format expected by Client and Propulsion-Test-Data
-CSV_UNITS_ROW = "psi,psi,psi,psi,psi,kg,N,C,C,C,C,s"
+CSV_UNITS_ROW = "kPa,kPa,kPa,kPa,kPa,N,N,C,C,C,C,s"
 CSV_CHANNELS = (
     "P_INJECTOR",
     "P_COMB_CHMBR",

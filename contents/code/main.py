@@ -4,8 +4,9 @@
 Flow Control System Server — Main Entrypoint.
 
 Starts the unified asyncio WebSocket server (`ws_server.py`) on
-0.0.0.0:8080/ws, attaching either physical hardware controllers or
-`MockHardwareSimulator` (`mocks.py`).
+0.0.0.0:8080/ws, attaching physical hardware controllers (`instrumentation.py`
+for LabJack U6 telemetry) or falling back to `MockHardwareSimulator`
+(`mocks.py`) per subsystem when hardware is absent or `--mock` is passed.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import os
 import signal
 from pathlib import Path
 
+from instrumentation import LabJackInstrumentation, detect_labjack_present
 from mocks import MockHardwareSimulator
 from ws_server import (
     DEFAULT_ACTUATORS_CONFIG,
@@ -28,8 +30,6 @@ from ws_server import (
 def detect_hardware_present(serial_port: str) -> bool:
     """
     Check if physical Valve Cart hardware (Arduino serial port) is present.
-    Until serial_controller / instrumentation modules are attached or if the
-    device node is absent, the server falls back to mock simulation mode.
     """
     return Path(serial_port).exists()
 
@@ -53,7 +53,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mock",
         action="store_true",
         default=os.environ.get("FCS_MOCK", "0") == "1",
-        help="Force hardware simulation / mock mode",
+        help="Force hardware simulation / mock mode for all subsystems",
+    )
+    parser.add_argument(
+        "--mock-labjack",
+        action="store_true",
+        default=os.environ.get("FCS_MOCK_LABJACK", "0") == "1",
+        help="Force mock telemetry simulation for LabJack U6 only",
+    )
+    parser.add_argument(
+        "--mock-serial",
+        action="store_true",
+        default=os.environ.get("FCS_MOCK_SERIAL", "0") == "1",
+        help="Force mock valve actuation for Controls Arduino serial only",
     )
     parser.add_argument(
         "--serial-port",
@@ -65,7 +77,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--armed",
         dest="armed",
         action="store_true",
-        help="Start server in ARMED state (default in mock mode)",
+        help="Start server in ARMED state (default in full mock mode)",
     )
     arm_group.add_argument(
         "--safe",
@@ -78,7 +90,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rate",
         type=float,
         default=float(os.environ.get("FCS_BROADCAST_HZ", "20.0")),
-        help="Telemetry broadcast rate in Hz (default: 20.0)",
+        help="Mock telemetry broadcast rate in Hz (default: 20.0; hardware streams full-rate)",
     )
     parser.add_argument(
         "--transit-delay",
@@ -114,35 +126,55 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def async_main(args: argparse.Namespace) -> None:
-    hw_present = detect_hardware_present(args.serial_port)
-    mock_mode = bool(args.mock or not hw_present)
+    log = logging.getLogger("fcs.main")
 
-    if not args.mock and not hw_present:
-        logging.getLogger("fcs.main").warning(
+    lj_present = False if (args.mock or args.mock_labjack) else detect_labjack_present()
+    serial_present = False if (args.mock or args.mock_serial) else detect_hardware_present(args.serial_port)
+
+    mock_labjack = bool(args.mock or args.mock_labjack or not lj_present)
+    # Until serial_controller is wired in, serial falls back to mock actuation
+    mock_serial = True
+
+    if not args.mock and not args.mock_labjack and not lj_present:
+        log.warning(
+            "LabJack U6 not detected (or u6/exodriver unavailable); "
+            "falling back to MOCK telemetry automatically."
+        )
+    elif not mock_labjack:
+        log.info("LabJack U6 detected; using live full-rate LabJack telemetry.")
+
+    if not args.mock and not args.mock_serial and not serial_present:
+        log.warning(
             "Hardware serial port '%s' not found; "
-            "falling back to MOCK mode automatically.",
+            "falling back to MOCK valve actuation.",
             args.serial_port,
         )
 
-    # Default to ARMED in mock mode for immediate desktop testing unless --safe
-    initial_armed = args.armed if args.armed is not None else mock_mode
+    full_mock = mock_labjack and mock_serial
+    # Default to ARMED only in full mock mode for desktop testing unless --safe
+    initial_armed = args.armed if args.armed is not None else full_mock
 
-    system_name = (
-        "Flow-Control-System-Server (Mock)"
-        if mock_mode
-        else "Flow-Control-System-Server"
-    )
-    connect_alert = (
-        {
+    if full_mock:
+        system_name = "Flow-Control-System-Server (Mock)"
+        connect_alert: dict[str, str] | None = {
             "level": "WARN",
             "message": (
                 "Server is running in MOCK SIMULATION mode "
                 "(no physical hardware active)."
             ),
         }
-        if mock_mode
-        else None
-    )
+    elif mock_serial:
+        system_name = "Flow-Control-System-Server (Live LabJack)"
+        connect_alert = {
+            "level": "INFO",
+            "message": (
+                "LabJack U6 live telemetry active "
+                "(valve actuation in mock simulation mode)."
+            ),
+        }
+    else:
+        system_name = "Flow-Control-System-Server"
+        connect_alert = None
 
     server = FlowControlWSServer(
         host=args.host,
@@ -154,15 +186,25 @@ async def async_main(args: argparse.Namespace) -> None:
         connect_alert=connect_alert,
     )
 
+    lj_inst: LabJackInstrumentation | None = None
     mock_sim: MockHardwareSimulator | None = None
-    if mock_mode:
+
+    if not mock_labjack:
+        lj_inst = LabJackInstrumentation(ws_server=server)
+        server.instrumentation = lj_inst
+        lj_inst.start()
+
+    if mock_labjack or mock_serial:
         mock_sim = MockHardwareSimulator(
             ws_server=server,
             broadcast_rate_hz=args.rate,
             transit_delay=args.transit_delay,
+            enable_telemetry=mock_labjack,
         )
-        server.serial_controller = mock_sim
-        server.instrumentation = mock_sim
+        if mock_serial:
+            server.serial_controller = mock_sim
+        if mock_labjack:
+            server.instrumentation = mock_sim
         mock_sim.start()
 
     loop = asyncio.get_running_loop()
@@ -175,6 +217,8 @@ async def async_main(args: argparse.Namespace) -> None:
     try:
         await server.serve_forever()
     finally:
+        if lj_inst is not None:
+            await lj_inst.stop()
         if mock_sim is not None:
             await mock_sim.stop()
 

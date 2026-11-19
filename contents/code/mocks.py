@@ -7,8 +7,8 @@ Provides `MockHardwareSimulator`, which emulates both:
   1. Controls Arduino USB serial valve controller (`send_valve_command`,
      `send_abort`, `send_unabort`, `request_summary`) with non-blocking
      async limit-switch transit delays.
-  2. LabJack U6 20 Hz telemetry stream (`P_*` in PSI, `T_*` in °C, `L_*` in
-     lbf) with physics-inspired waveforms that respond dynamically to virtual
+  2. LabJack U6 telemetry stream (`P_*` in kPa, `T_*` in °C, `L_*` in
+     N) with physics-inspired waveforms that respond dynamically to virtual
      valve states.
 """
 
@@ -65,28 +65,30 @@ class MockHardwareSimulator:
         ws_server: FlowControlWSServer,
         broadcast_rate_hz: float = 20.0,
         transit_delay: float = 1.5,
+        enable_telemetry: bool = True,
     ):
         self.ws_server = ws_server
         self.broadcast_rate_hz = max(1.0, float(broadcast_rate_hz))
         self.transit_delay = max(0.0, float(transit_delay))
+        self.enable_telemetry = bool(enable_telemetry)
 
         self._start_mono: float = time.monotonic()
         self._packet_id: int = 0
         self._actuation_tasks: dict[str, asyncio.Task[Any]] = {}
         self._telemetry_task: asyncio.Task[Any] | None = None
 
-        # Simulated sensor state in client engineering units (PSI, °C, lbf)
+        # Simulated sensor state in client engineering units (kPa, °C, N)
         self._sim_state: dict[str, float] = {
-            "P_RUN_TANK": 14.7,
-            "P_INJECTOR": 14.7,
-            "P_N2O_FLOW": 14.7,
-            "P_N2_FLOW": 14.7,
-            "P_COMB_CHMBR": 14.7,
+            "P_RUN_TANK": 101.3,
+            "P_INJECTOR": 101.3,
+            "P_N2O_FLOW": 101.3,
+            "P_N2_FLOW": 101.3,
+            "P_COMB_CHMBR": 101.3,
             "T_RUN_TANK": 20.5,
             "T_INJECTOR": 21.0,
             "T_COMB_CHMBR": 22.0,
             "T_POST_COMB": 21.5,
-            "L_RUN_TANK": 12.4,
+            "L_RUN_TANK": 55.2,
             "L_THRUST": 0.0,
         }
 
@@ -94,9 +96,11 @@ class MockHardwareSimulator:
     # Lifecycle
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """Start the background 20 Hz simulated telemetry task."""
+        """Start the background simulated telemetry task (if enabled)."""
         self._start_mono = time.monotonic()
-        if self._telemetry_task is None or self._telemetry_task.done():
+        if self.enable_telemetry and (
+            self._telemetry_task is None or self._telemetry_task.done()
+        ):
             self._telemetry_task = asyncio.create_task(self._telemetry_loop())
 
     async def stop(self) -> None:
@@ -209,9 +213,9 @@ class MockHardwareSimulator:
         rtv_state = valves.get("RTV", "CLOSED")
         mev_active = valves.get("MEV") in ("OPEN", "FIRED")
 
-        # Supply line pressures
-        target_n2o_flow = 760.0 if n2ov_open else 14.7
-        target_n2_flow = 820.0 if n2ov_open else 14.7
+        # Supply line pressures [kPa]
+        target_n2o_flow = 5240.0 if n2ov_open else 101.3
+        target_n2_flow = 5654.0 if n2ov_open else 101.3
         s["P_N2O_FLOW"] += (
             (target_n2o_flow - s["P_N2O_FLOW"]) * min(1.0, dt * 3.5)
         )
@@ -219,25 +223,25 @@ class MockHardwareSimulator:
             (target_n2_flow - s["P_N2_FLOW"]) * min(1.0, dt * 3.0)
         )
 
-        # Run tank pressure & propellant mass response
+        # Run tank pressure [kPa] & propellant weight [N] response
         if n2ov_open and rtv_state == "FILL" and not dump_open:
-            s["P_RUN_TANK"] = min(755.0, s["P_RUN_TANK"] + 65.0 * dt)
-            s["L_RUN_TANK"] = min(48.5, s["L_RUN_TANK"] + 1.8 * dt)
+            s["P_RUN_TANK"] = min(5205.0, s["P_RUN_TANK"] + 448.0 * dt)
+            s["L_RUN_TANK"] = min(215.7, s["L_RUN_TANK"] + 8.0 * dt)
             s["T_RUN_TANK"] += (16.5 - s["T_RUN_TANK"]) * min(1.0, dt * 0.8)
         elif dump_open or rtv_state == "VENT":
-            s["P_RUN_TANK"] = max(14.7, s["P_RUN_TANK"] - 110.0 * dt)
-            s["L_RUN_TANK"] = max(12.0, s["L_RUN_TANK"] - 2.2 * dt)
+            s["P_RUN_TANK"] = max(101.3, s["P_RUN_TANK"] - 758.0 * dt)
+            s["L_RUN_TANK"] = max(53.4, s["L_RUN_TANK"] - 9.8 * dt)
             s["T_RUN_TANK"] += (8.0 - s["T_RUN_TANK"]) * min(1.0, dt * 0.5)
         else:
             s["T_RUN_TANK"] += (20.5 - s["T_RUN_TANK"]) * min(1.0, dt * 0.1)
 
         # Engine / injector / chamber response when MEV is open or fired
-        if mev_active and s["P_RUN_TANK"] > 30.0:
-            s["P_RUN_TANK"] = max(14.7, s["P_RUN_TANK"] - 85.0 * dt)
-            s["L_RUN_TANK"] = max(10.0, s["L_RUN_TANK"] - 3.5 * dt)
+        if mev_active and s["P_RUN_TANK"] > 206.8:
+            s["P_RUN_TANK"] = max(101.3, s["P_RUN_TANK"] - 586.0 * dt)
+            s["L_RUN_TANK"] = max(44.5, s["L_RUN_TANK"] - 15.6 * dt)
             target_inj = s["P_RUN_TANK"] * 0.78
             target_cc = s["P_RUN_TANK"] * 0.58
-            target_thrust = max(0.0, (target_cc - 14.7) * 0.95)
+            target_thrust = max(0.0, (target_cc - 101.3) * 0.61)
             s["P_INJECTOR"] += (
                 (target_inj - s["P_INJECTOR"]) * min(1.0, dt * 6.0)
             )
@@ -255,8 +259,8 @@ class MockHardwareSimulator:
                 (515.0 - s["T_POST_COMB"]) * min(1.0, dt * 2.0)
             )
         else:
-            s["P_INJECTOR"] += (14.7 - s["P_INJECTOR"]) * min(1.0, dt * 4.0)
-            s["P_COMB_CHMBR"] += (14.7 - s["P_COMB_CHMBR"]) * min(1.0, dt * 4)
+            s["P_INJECTOR"] += (101.3 - s["P_INJECTOR"]) * min(1.0, dt * 4.0)
+            s["P_COMB_CHMBR"] += (101.3 - s["P_COMB_CHMBR"]) * min(1.0, dt * 4)
             s["L_THRUST"] += (0.0 - s["L_THRUST"]) * min(1.0, dt * 8.0)
             s["T_INJECTOR"] += (21.0 - s["T_INJECTOR"]) * min(1.0, dt * 0.5)
             s["T_COMB_CHMBR"] += (
@@ -270,26 +274,26 @@ class MockHardwareSimulator:
             "seconds": round(uptime, 3),
             "uptime": round(uptime, 3),
             "P_RUN_TANK": round(
-                max(0.0, s["P_RUN_TANK"] + 0.3 * ripple + _noise(0.25)), 2
+                max(0.0, s["P_RUN_TANK"] + 2.0 * ripple + _noise(1.7)), 2
             ),
             "P_INJECTOR": round(
-                max(0.0, s["P_INJECTOR"] + 0.2 * ripple + _noise(0.20)), 2
+                max(0.0, s["P_INJECTOR"] + 1.4 * ripple + _noise(1.4)), 2
             ),
             "P_N2O_FLOW": round(
-                max(0.0, s["P_N2O_FLOW"] + 0.25 * ripple + _noise(0.20)), 2
+                max(0.0, s["P_N2O_FLOW"] + 1.7 * ripple + _noise(1.4)), 2
             ),
             "P_N2_FLOW": round(
-                max(0.0, s["P_N2_FLOW"] + 0.25 * ripple + _noise(0.20)), 2
+                max(0.0, s["P_N2_FLOW"] + 1.7 * ripple + _noise(1.4)), 2
             ),
             "P_COMB_CHMBR": round(
-                max(0.0, s["P_COMB_CHMBR"] + 0.2 * ripple + _noise(0.20)), 2
+                max(0.0, s["P_COMB_CHMBR"] + 1.4 * ripple + _noise(1.4)), 2
             ),
             "T_RUN_TANK": round(s["T_RUN_TANK"] + _noise(0.05), 2),
             "T_INJECTOR": round(s["T_INJECTOR"] + _noise(0.05), 2),
             "T_COMB_CHMBR": round(s["T_COMB_CHMBR"] + _noise(0.15), 2),
             "T_POST_COMB": round(s["T_POST_COMB"] + _noise(0.12), 2),
-            "L_RUN_TANK": round(max(0.0, s["L_RUN_TANK"] + _noise(0.03)), 2),
-            "L_THRUST": round(max(0.0, s["L_THRUST"] + _noise(0.15)), 2),
+            "L_RUN_TANK": round(max(0.0, s["L_RUN_TANK"] + _noise(0.13)), 2),
+            "L_THRUST": round(max(0.0, s["L_THRUST"] + _noise(0.65)), 2),
         }
 
     async def _telemetry_loop(self) -> None:
