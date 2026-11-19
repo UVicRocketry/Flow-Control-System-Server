@@ -83,6 +83,7 @@ CMakeLists.txt.user*
 /build*/
 /.qtcreator/
 
-# SSH password files
+# SSH password files & cached offline dependency bundles
 password.txt
 **/password.txt
+tools/vendor/
