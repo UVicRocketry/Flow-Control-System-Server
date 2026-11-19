@@ -20,6 +20,7 @@ from pathlib import Path
 
 from instrumentation import LabJackInstrumentation, detect_labjack_present
 from mocks import MockHardwareSimulator
+from sensors_config import DEFAULT_SENSORS_CONFIG
 from ws_server import (
     DEFAULT_ACTUATORS_CONFIG,
     DEFAULT_DATA_DIR,
@@ -90,7 +91,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rate",
         type=float,
         default=float(os.environ.get("FCS_BROADCAST_HZ", "20.0")),
-        help="Mock telemetry broadcast rate in Hz (default: 20.0; hardware streams full-rate)",
+        help="WebSocket telemetry broadcast rate in Hz (default: 20.0; LabJack logs full rate)",
     )
     parser.add_argument(
         "--transit-delay",
@@ -102,19 +103,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--config",
         type=Path,
         default=DEFAULT_ACTUATORS_CONFIG,
-        help=(
-            "Path to actuators.json config "
-            f"(default: {DEFAULT_ACTUATORS_CONFIG})"
-        ),
+        help=(f"Path to actuators.json config (default: {DEFAULT_ACTUATORS_CONFIG})"),
+    )
+    parser.add_argument(
+        "--sensors-config",
+        type=Path,
+        default=DEFAULT_SENSORS_CONFIG,
+        help=(f"Path to sensors.json config (default: {DEFAULT_SENSORS_CONFIG})"),
     )
     parser.add_argument(
         "--data-dir",
         type=Path,
         default=DEFAULT_DATA_DIR,
-        help=(
-            "Directory for recorded telemetry files "
-            f"(default: {DEFAULT_DATA_DIR})"
-        ),
+        help=(f"Directory for recorded telemetry files (default: {DEFAULT_DATA_DIR})"),
     )
     parser.add_argument(
         "--log-level",
@@ -125,11 +126,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_mode_banner(
+    mock_labjack: bool, mock_serial: bool
+) -> tuple[str, dict[str, str] | None]:
+    if mock_labjack and mock_serial:
+        return (
+            "Flow-Control-System-Server (Mock)",
+            {
+                "level": "WARN",
+                "message": (
+                    "Server is running in MOCK SIMULATION mode "
+                    "(no physical hardware active)."
+                ),
+            },
+        )
+    if mock_serial:
+        return (
+            "Flow-Control-System-Server (Live LabJack)",
+            {
+                "level": "INFO",
+                "message": (
+                    "LabJack U6 live telemetry active "
+                    "(valve actuation in mock simulation mode)."
+                ),
+            },
+        )
+    return "Flow-Control-System-Server", None
+
+
 async def async_main(args: argparse.Namespace) -> None:
     log = logging.getLogger("fcs.main")
 
     lj_present = False if (args.mock or args.mock_labjack) else detect_labjack_present()
-    serial_present = False if (args.mock or args.mock_serial) else detect_hardware_present(args.serial_port)
+    serial_present = (
+        False
+        if (args.mock or args.mock_serial)
+        else detect_hardware_present(args.serial_port)
+    )
 
     mock_labjack = bool(args.mock or args.mock_labjack or not lj_present)
     # Until serial_controller is wired in, serial falls back to mock actuation
@@ -153,34 +186,14 @@ async def async_main(args: argparse.Namespace) -> None:
     full_mock = mock_labjack and mock_serial
     # Default to ARMED only in full mock mode for desktop testing unless --safe
     initial_armed = args.armed if args.armed is not None else full_mock
-
-    if full_mock:
-        system_name = "Flow-Control-System-Server (Mock)"
-        connect_alert: dict[str, str] | None = {
-            "level": "WARN",
-            "message": (
-                "Server is running in MOCK SIMULATION mode "
-                "(no physical hardware active)."
-            ),
-        }
-    elif mock_serial:
-        system_name = "Flow-Control-System-Server (Live LabJack)"
-        connect_alert = {
-            "level": "INFO",
-            "message": (
-                "LabJack U6 live telemetry active "
-                "(valve actuation in mock simulation mode)."
-            ),
-        }
-    else:
-        system_name = "Flow-Control-System-Server"
-        connect_alert = None
+    system_name, connect_alert = _resolve_mode_banner(mock_labjack, mock_serial)
 
     server = FlowControlWSServer(
         host=args.host,
         port=args.port,
         armed=initial_armed,
         config_path=args.config,
+        sensors_config_path=args.sensors_config,
         data_dir=args.data_dir,
         system_name=system_name,
         connect_alert=connect_alert,
@@ -190,7 +203,11 @@ async def async_main(args: argparse.Namespace) -> None:
     mock_sim: MockHardwareSimulator | None = None
 
     if not mock_labjack:
-        lj_inst = LabJackInstrumentation(ws_server=server)
+        lj_inst = LabJackInstrumentation(
+            ws_server=server,
+            broadcast_rate_hz=args.rate,
+            sensors_config=server.sensors_config,
+        )
         server.instrumentation = lj_inst
         lj_inst.start()
 

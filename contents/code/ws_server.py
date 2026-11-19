@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified Asyncio WebSocket Server (`ws_server.py`) for
+Unified FastAPI + WebSocket Server (`ws_server.py`) for
 Flow-Control-System-Server.
 
-Implements the Server <-> Client WebSocket wire protocol on
-ws://0.0.0.0:8080/ws:
-  - Multi-client connection registry & non-blocking broadcast
-  - Initial handshake (`init`) with dynamic actuator definitions
-  - Inbound message router (`command`/`CTRL`, `abort`, `unabort`, `summary`,
-    `record`, `remote_data_req`)
-  - Hardware safety interlock validation (armed, external, single-use)
-  - On-cart two-row header CSV telemetry recording & remote file RPC
+Provides:
+  - `WS /ws`: Real-time JSON frames (`init` including `channels` from
+    `sensors.json`, decimated `telemetry`, `valve_state`, `summary`, `armed`,
+    `alert`, and control/abort/unabort/summary/record dispatch).
+  - HTTP `/api/data/...`: Streaming log list, download, upload, rename, and
+    delete backed by `DataRecorder`.
 """
 
 from __future__ import annotations
@@ -21,29 +19,49 @@ import inspect
 import json
 import logging
 import sys
-import time
-from datetime import datetime
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 try:
-    from websockets.asyncio.server import (  # type: ignore
-        broadcast as _ws_broadcast,
-    )
-    from websockets.asyncio.server import (  # type: ignore
-        serve as _ws_serve,
-    )
-    from websockets.exceptions import (  # type: ignore
-        ConnectionClosed as _WSConnectionClosed,
-    )
-except ImportError:
-    import websockets  # type: ignore
-    from websockets.exceptions import (  # type: ignore
-        ConnectionClosed as _WSConnectionClosed,
-    )
+    import uvicorn  # type: ignore
+    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect  # type: ignore
+    from fastapi.responses import FileResponse  # type: ignore
 
-    _ws_serve = websockets.serve
-    _ws_broadcast = getattr(websockets, "broadcast", None)
+    HAS_FASTAPI = True
+except ImportError:  # pragma: no cover - optional in lightweight local envs
+    uvicorn = None  # type: ignore[assignment]
+    FastAPI = None  # type: ignore[assignment,misc]
+    HTTPException = Exception  # type: ignore[assignment,misc]
+    Request = Any  # type: ignore[assignment,misc]
+    WebSocket = Any  # type: ignore[assignment,misc]
+    WebSocketDisconnect = ConnectionError  # type: ignore[assignment,misc]
+    FileResponse = None  # type: ignore[assignment,misc]
+    HAS_FASTAPI = False
+
+try:
+    from websockets.asyncio.server import serve as _ws_serve  # type: ignore
+    from websockets.exceptions import ConnectionClosed as _WSConnectionClosed  # type: ignore
+except ImportError:  # pragma: no cover - fallback when fastapi/ws absent
+    try:
+        import websockets  # type: ignore
+        from websockets.exceptions import ConnectionClosed as _WSConnectionClosed  # type: ignore
+
+        _ws_serve = websockets.serve
+    except ImportError:
+        _ws_serve = None  # type: ignore[assignment]
+        _WSConnectionClosed = ConnectionError  # type: ignore[assignment,misc]
+
+from data_recorder import (
+    DataRecorder,
+    sanitize_filename,
+    sanitize_telemetry_for_json,
+)
+from sensors_config import (
+    DEFAULT_SENSORS_CONFIG,
+    SensorsConfig,
+    load_sensors_config,
+)
 
 logger = logging.getLogger("fcs.ws_server")
 
@@ -51,23 +69,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_ACTUATORS_CONFIG = REPO_ROOT / "contents" / "config" / "actuators.json"
 DEFAULT_DATA_DIR = REPO_ROOT / "data"
 
-# Two-row CSV format expected by Client and Propulsion-Test-Data
-CSV_UNITS_ROW = "kPa,kPa,kPa,kPa,kPa,N,N,C,C,C,C,s"
-CSV_CHANNELS = (
-    "P_INJECTOR",
-    "P_COMB_CHMBR",
-    "P_N2O_FLOW",
-    "P_N2_FLOW",
-    "P_RUN_TANK",
-    "L_RUN_TANK",
-    "L_THRUST",
-    "T_RUN_TANK",
-    "T_INJECTOR",
-    "T_COMB_CHMBR",
-    "T_POST_COMB",
-    "seconds",
-)
-CSV_CHANNELS_ROW = ",".join(CSV_CHANNELS)
+_DEFAULT_SENSORS = load_sensors_config(DEFAULT_SENSORS_CONFIG)
+CSV_CHANNELS: tuple[str, ...] = _DEFAULT_SENSORS.csv_channels()
+CSV_UNITS_ROW: str = _DEFAULT_SENSORS.csv_units_row()
+CSV_CHANNELS_ROW: str = _DEFAULT_SENSORS.csv_channels_row()
 
 # Firmware / legacy valve state aliases -> normalized client states
 STATE_NORMALIZATION_MAP: dict[str, str] = {
@@ -96,53 +101,15 @@ def normalize_valve_state(state: str) -> str:
     return STATE_NORMALIZATION_MAP.get(raw, raw)
 
 
-def sanitize_filename(name: str | None) -> str | None:
-    """
-    Sanitize a filename so remote_data_req / record cannot escape data_dir.
-    Returns None if the filename is empty or invalid.
-    """
-    if not name or not isinstance(name, str):
-        return None
-    cleaned = name.strip()
-    if not cleaned or "/" in cleaned or "\\" in cleaned or ".." in cleaned:
-        return None
-    base = Path(cleaned).name
-    if not base or base in (".", ".."):
-        return None
-    return base
+def _timestamp_filename() -> str:
+    from datetime import datetime
 
-
-def _flatten_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    """Flatten grouped telemetry sub-dictionaries into a single dict."""
-    flat: dict[str, Any] = dict(sample)
-    for group_key in ("pressures", "temperatures", "loads"):
-        sub = sample.get(group_key)
-        if isinstance(sub, dict):
-            flat.update(sub)
-    return flat
-
-
-def _format_csv_row(flat: dict[str, Any], rec_seconds: float) -> str:
-    """Format a flattened telemetry sample into a CSV data row."""
-    row_values: list[str] = []
-    for ch in CSV_CHANNELS:
-        val = rec_seconds if ch == "seconds" else flat.get(ch, 0.0)
-        try:
-            row_values.append(f"{float(val):.4f}")
-        except (TypeError, ValueError):
-            row_values.append("0.0000")
-    return ",".join(row_values) + "\n"
+    return f"telemetry_{datetime.now().strftime('%Y_%m_%d_%H%M%S')}.csv"
 
 
 class FlowControlWSServer:
     """
-    Unified WebSocket server for the Valve Cart Flow Control System.
-
-    Manages:
-      - Multi-client WebSocket connections (`ws://<host>:<port>/ws`)
-      - Actuator definitions (`contents/config/actuators.json`) and states
-      - Inbound command routing and safety interlock enforcement
-      - On-cart CSV session recording and remote file RPC
+    Unified FastAPI + WebSocket server for the Valve Cart Flow Control System.
     """
 
     def __init__(
@@ -157,6 +124,8 @@ class FlowControlWSServer:
         data_recorder: Any = None,
         system_name: str = "Flow-Control-System-Server",
         connect_alert: dict[str, str] | None = None,
+        sensors_config_path: Path | str | None = None,
+        sensors_config: SensorsConfig | None = None,
     ):
         self.host = host
         self.port = int(port)
@@ -169,27 +138,20 @@ class FlowControlWSServer:
         )
         self.data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.sensors_config = sensors_config or load_sensors_config(
+            sensors_config_path or DEFAULT_SENSORS_CONFIG
+        )
 
-        # Hardware / simulation / recorder subsystem hooks
         self.serial_controller = serial_controller
         self.instrumentation = instrumentation
-        self.data_recorder = data_recorder
+        self.data_recorder = data_recorder or DataRecorder(
+            self.data_dir, sensors_config=self.sensors_config
+        )
 
-        # Connected WebSocket clients
         self.clients: set[Any] = set()
-
-        # Actuator definitions and current states
         self.actuators: list[dict[str, Any]] = []
         self.valve_states: dict[str, str] = {}
         self.reload_actuators_config()
-
-        # Built-in CSV recording state (fallback if no data_recorder)
-        self._recording_active: bool = False
-        self._recording_filename: str | None = None
-        self._recording_file: Any = None
-        self._recording_start_mono: float = 0.0
-        self._last_flush_mono: float = 0.0
-        self._flush_interval_sec: float = 2.5
 
         self._background_tasks: list[asyncio.Task[Any]] = []
         self._stop_event: asyncio.Event | None = None
@@ -199,19 +161,11 @@ class FlowControlWSServer:
     # ------------------------------------------------------------------
     @property
     def is_recording(self) -> bool:
-        if self.data_recorder is not None and hasattr(
-            self.data_recorder, "is_recording"
-        ):
-            return bool(self.data_recorder.is_recording)
-        return self._recording_active
+        return bool(getattr(self.data_recorder, "is_recording", False))
 
     @property
     def recording_filename(self) -> str | None:
-        if self.data_recorder is not None and hasattr(
-            self.data_recorder, "recording_filename"
-        ):
-            return self.data_recorder.recording_filename
-        return self._recording_filename
+        return getattr(self.data_recorder, "recording_filename", None)
 
     def reload_actuators_config(self) -> None:
         """Load actuator definitions from actuators.json and init states."""
@@ -249,11 +203,18 @@ class FlowControlWSServer:
     # ------------------------------------------------------------------
     # Outbound Messaging & Multi-Client Broadcast
     # ------------------------------------------------------------------
+    @staticmethod
+    async def _send_raw(client: Any, raw: str) -> None:
+        if hasattr(client, "send_text"):
+            await client.send_text(raw)
+        else:
+            await client.send(raw)
+
     async def send_to(self, client: Any, payload: dict[str, Any]) -> None:
         """Send a JSON packet to a single WebSocket client."""
-        raw = json.dumps(payload)
+        raw = json.dumps(payload, allow_nan=False)
         try:
-            await client.send(raw)
+            await self._send_raw(client, raw)
         except Exception as exc:
             logger.debug(
                 "Failed sending to client %s: %s",
@@ -266,19 +227,11 @@ class FlowControlWSServer:
         """Broadcast a JSON packet to all connected WebSocket clients."""
         if not self.clients:
             return
-        raw = json.dumps(payload)
-
-        if _ws_broadcast is not None:
-            try:
-                _ws_broadcast(self.clients, raw)
-                return
-            except Exception as exc:
-                logger.debug("websockets.broadcast fallback: %s", exc)
-
+        raw = json.dumps(payload, allow_nan=False)
         stale: list[Any] = []
         for client in list(self.clients):
             try:
-                await client.send(raw)
+                await self._send_raw(client, raw)
             except Exception:
                 stale.append(client)
         for client in stale:
@@ -293,11 +246,12 @@ class FlowControlWSServer:
             "recording": self.is_recording,
             "recording_filename": self.recording_filename,
             "actuators": self.actuators,
+            "channels": self.sensors_config.ws_channels_metadata(),
             "valves": dict(self.valve_states),
         }
 
     async def send_init(self, client: Any) -> None:
-        """Send initial state & actuator config to a newly connected client."""
+        """Send initial state, actuators, and sensor channel config to a client."""
         await self.send_to(client, self.build_init_payload())
         if self.connect_alert:
             await self.send_alert(
@@ -363,13 +317,22 @@ class FlowControlWSServer:
                 }
             )
 
-    async def broadcast_telemetry(self, sample: dict[str, Any]) -> None:
-        """Record a telemetry sample (if active) and broadcast to clients."""
-        self._write_recording_row(sample)
-        await self.broadcast({"type": "telemetry", "data": sample})
+    def record_telemetry(self, sample: dict[str, Any]) -> None:
+        """Write one telemetry sample to disk when recording is active."""
+        if hasattr(self.data_recorder, "write_sample"):
+            self.data_recorder.write_sample(sample)
+
+    async def broadcast_telemetry(
+        self, sample: dict[str, Any], *, record: bool = True
+    ) -> None:
+        """Optionally record a telemetry sample and broadcast NaN-safe JSON."""
+        if record:
+            self.record_telemetry(sample)
+        clean_sample = sanitize_telemetry_for_json(sample)
+        await self.broadcast({"type": "telemetry", "data": clean_sample})
 
     # ------------------------------------------------------------------
-    # Inbound Message Router
+    # Inbound WebSocket Message Router
     # ------------------------------------------------------------------
     async def handle_message(self, client: Any, raw_message: str) -> None:
         """Parse UTF-8 JSON / JSONL frames and dispatch each message."""
@@ -414,7 +377,7 @@ class FlowControlWSServer:
             )
 
     # ------------------------------------------------------------------
-    # Command Handlers
+    # Command Handlers & Interlocks
     # ------------------------------------------------------------------
     async def _check_actuator_interlocks(
         self, client: Any, valve: str, action: str
@@ -544,21 +507,76 @@ class FlowControlWSServer:
         await self.set_armed(new_armed)
 
     # ------------------------------------------------------------------
-    # Telemetry Recording & Remote Data File Management
+    # Recording & HTTP /api/data + Legacy WS File Management
     # ------------------------------------------------------------------
+    def _build_remote_data_list_payload(self) -> dict[str, Any]:
+        return {
+            "type": "remote_data_list",
+            "files": self.data_recorder.list_files(),
+        }
+
+    def api_list_data_files(self) -> dict[str, Any]:
+        """Return HTTP `/api/data` directory listing payload."""
+        return {
+            "files": self.data_recorder.list_files(),
+            "recording": self.is_recording,
+            "recording_filename": self.recording_filename,
+        }
+
+    def api_resolve_download(self, filename: str, mode: str = "load") -> Path:
+        """Resolve a downloadable file path inside `data_dir`."""
+        return self.data_recorder.resolve_download_path(filename, mode=mode)
+
+    async def api_upload_data_chunks(
+        self, filename: str, chunks: Iterable[bytes]
+    ) -> dict[str, Any]:
+        """Save uploaded byte chunks and broadcast the updated file list."""
+        saved_name, overwrote, total_bytes = self.data_recorder.save_upload_chunks(
+            filename, chunks
+        )
+        await self.broadcast(self._build_remote_data_list_payload())
+        return {
+            "status": "ok",
+            "filename": saved_name,
+            "overwrote": overwrote,
+            "bytes": total_bytes,
+        }
+
+    async def api_upload_data_file(
+        self, filename: str, content: bytes | str
+    ) -> dict[str, Any]:
+        """Save uploaded content and broadcast the updated file list."""
+        raw_bytes = content.encode("utf-8") if isinstance(content, str) else content
+        return await self.api_upload_data_chunks(filename, (raw_bytes,))
+
+    async def api_rename_data_file(
+        self, filename: str, new_name: str
+    ) -> dict[str, Any]:
+        """Rename a telemetry log and broadcast the updated file list."""
+        old_clean, new_clean = self.data_recorder.rename_file(filename, new_name)
+        await self.broadcast(self._build_remote_data_list_payload())
+        return {
+            "status": "ok",
+            "old_name": old_clean,
+            "new_name": new_clean,
+        }
+
+    async def api_delete_data_file(self, filename: str) -> dict[str, Any]:
+        """Delete a telemetry log and broadcast the updated file list."""
+        clean_name = self.data_recorder.delete_file(filename)
+        await self.broadcast(self._build_remote_data_list_payload())
+        return {"status": "ok", "filename": clean_name}
+
     async def _handle_record(self, client: Any, msg: dict[str, Any]) -> None:
         active = bool(msg.get("active", False))
-        stamp = datetime.now().strftime("%Y_%m_%d_%H%M%S")
         raw_name = (
             msg.get("filename")
             or msg.get("session_name")
             or msg.get("name")
-            or f"telemetry_{stamp}.csv"
+            or _timestamp_filename()
         )
 
-        if self.data_recorder is not None and hasattr(
-            self.data_recorder, "set_recording"
-        ):
+        if hasattr(self.data_recorder, "set_recording"):
             res = self.data_recorder.set_recording(active, raw_name)
             if inspect.isawaitable(res):
                 await res
@@ -572,179 +590,82 @@ class FlowControlWSServer:
             await self._stop_recording_session()
 
     async def _start_recording_session(self, client: Any, raw_name: str) -> None:
-        filename = sanitize_filename(raw_name)
-        if not filename:
+        was_same = (
+            self.is_recording and sanitize_filename(raw_name) == self.recording_filename
+        )
+        try:
+            filename = self.data_recorder.start_recording(raw_name)
+        except ValueError:
             await self.send_alert(
                 "ERR",
                 f"Invalid recording filename: {raw_name!r}",
                 client=client,
             )
             return
-        if not filename.lower().endswith((".csv", ".jsonl")):
-            filename = f"{filename}.csv"
-
-        if self._recording_active and self._recording_filename == filename:
-            logger.info(
-                "Recording already active for %s (idempotent re-sync)",
-                filename,
+        if not was_same:
+            await self.send_alert(
+                "INFO", f"Server telemetry recording started: {filename}"
             )
-            return
-
-        if self._recording_active:
-            self._stop_builtin_recording()
-
-        self._start_builtin_recording(filename)
-        await self.send_alert("INFO", f"Server telemetry recording started: {filename}")
 
     async def _stop_recording_session(self) -> None:
-        if not self._recording_active:
+        finished_name = self.data_recorder.stop_recording()
+        if finished_name is None:
             return
-        finished_name = self._recording_filename
-        self._stop_builtin_recording()
         await self.broadcast(self._build_remote_data_list_payload())
         await self.send_alert(
             "INFO", f"Server telemetry recording saved: {finished_name}"
         )
 
-    def _start_builtin_recording(self, filename: str) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        filepath = self.data_dir / filename
-        exists_nonempty = filepath.exists() and filepath.stat().st_size > 0
-        self._recording_file = open(filepath, "a", encoding="utf-8", buffering=1)
-        if not exists_nonempty:
-            self._recording_file.write(CSV_UNITS_ROW + "\n")
-            self._recording_file.write(CSV_CHANNELS_ROW + "\n")
-            self._recording_file.flush()
-        self._recording_filename = filename
-        self._recording_active = True
-        self._recording_start_mono = time.monotonic()
-        self._last_flush_mono = self._recording_start_mono
-        logger.info("Started on-cart telemetry recording -> %s", filepath)
-
-    def _write_recording_row(self, sample: dict[str, Any]) -> None:
-        if self.data_recorder is not None and hasattr(
-            self.data_recorder, "write_sample"
-        ):
-            self.data_recorder.write_sample(sample)
-            return
-
-        if not self._recording_active or self._recording_file is None:
-            return
-
-        flat = _flatten_sample(sample)
-        now_mono = time.monotonic()
-        rec_seconds = flat.get("seconds")
-        if rec_seconds is None:
-            rec_seconds = round(now_mono - self._recording_start_mono, 4)
-
-        row_line = _format_csv_row(flat, float(rec_seconds))
-        try:
-            self._recording_file.write(row_line)
-            if (now_mono - self._last_flush_mono) >= self._flush_interval_sec:
-                self._recording_file.flush()
-                self._last_flush_mono = now_mono
-        except Exception as exc:
-            logger.error(
-                "Failed writing telemetry row to %s: %s",
-                self._recording_filename,
-                exc,
-            )
-
-    def _stop_builtin_recording(self) -> None:
-        if self._recording_file is not None:
-            try:
-                self._recording_file.flush()
-                self._recording_file.close()
-            except Exception as exc:
-                logger.error("Error closing recording file: %s", exc)
-            self._recording_file = None
-        if self._recording_active:
-            logger.info(
-                "Stopped on-cart telemetry recording (%s)",
-                self._recording_filename,
-            )
-        self._recording_active = False
-        self._recording_filename = None
-
-    def _list_data_files(self) -> list[str]:
-        if not self.data_dir.exists():
-            return []
-        files = [
-            p.name
-            for p in self.data_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in (".csv", ".jsonl")
-        ]
-        files.sort(reverse=True)
-        return files
-
-    def _build_remote_data_list_payload(self) -> dict[str, Any]:
-        return {
-            "type": "remote_data_list",
-            "files": self._list_data_files(),
-        }
-
     async def _handle_remote_data_req(self, client: Any, msg: dict[str, Any]) -> None:
-        """Handle client `remote_data_req` operations (list/get/rename/del)."""
-        if self.data_recorder is not None and hasattr(
-            self.data_recorder, "handle_remote_request"
-        ):
+        """Handle legacy WS `remote_data_req` operations (list/get/put/rename/del)."""
+        if hasattr(self.data_recorder, "handle_remote_request"):
             res = self.data_recorder.handle_remote_request(client, msg)
             if inspect.isawaitable(res):
                 await res
             return
 
         operation = str(msg.get("operation") or "").strip().lower()
-        if operation == "list":
-            await self.send_to(client, self._build_remote_data_list_payload())
-        elif operation == "get":
-            await self._remote_get(client, msg)
-        elif operation in ("put", "upload"):
-            await self._remote_put(client, msg)
-        elif operation == "rename":
-            await self._remote_rename(client, msg)
-        elif operation == "delete":
-            await self._remote_delete(client, msg)
-        else:
+        handlers = {
+            "list": self._ws_remote_list,
+            "get": self._remote_get,
+            "put": self._remote_put,
+            "upload": self._remote_put,
+            "rename": self._remote_rename,
+            "delete": self._remote_delete,
+        }
+        handler = handlers.get(operation)
+        if handler is None:
             await self.send_alert(
                 "WARN",
                 f"Unknown remote_data_req operation: {operation!r}",
                 client=client,
             )
+            return
+        await handler(client, msg)
+
+    async def _ws_remote_list(self, client: Any, _msg: dict[str, Any]) -> None:
+        await self.send_to(client, self._build_remote_data_list_payload())
 
     async def _remote_get(self, client: Any, msg: dict[str, Any]) -> None:
         mode = str(msg.get("mode") or "load").strip()
         raw_filename = msg.get("filename")
-        if mode == "pull_recording" and not raw_filename:
-            raw_filename = self.recording_filename
-
-        filename = sanitize_filename(str(raw_filename or ""))
-        if not filename:
-            await self.send_alert(
-                "ERR",
-                "Remote data request failed: invalid filename.",
-                client=client,
-            )
-            return
-
-        filepath = self.data_dir / filename
-        if self._recording_active and self._recording_filename == filename:
-            self._flush_active_recording()
-
-        if not filepath.exists() or not filepath.is_file():
-            await self.send_alert(
-                "ERR",
-                f"Remote data file not found: {filename}",
-                client=client,
-            )
-            return
-
         try:
+            filepath = self.api_resolve_download(str(raw_filename or ""), mode=mode)
             content = filepath.read_text(encoding="utf-8", errors="replace")
+        except ValueError:
+            await self.send_alert(
+                "ERR", "Remote data request failed: invalid filename.", client=client
+            )
+            return
+        except FileNotFoundError:
+            await self.send_alert(
+                "ERR", f"Remote data file not found: {raw_filename}", client=client
+            )
+            return
         except Exception as exc:
-            logger.error("Failed reading remote file %s: %s", filepath, exc)
             await self.send_alert(
                 "ERR",
-                f"Failed to read remote file {filename}: {exc}",
+                f"Failed to read remote file {raw_filename}: {exc}",
                 client=client,
             )
             return
@@ -753,155 +674,179 @@ class FlowControlWSServer:
             client,
             {
                 "type": "remote_data_content",
-                "filename": filename,
+                "filename": filepath.name,
                 "mode": mode,
                 "content": content,
             },
         )
 
-    def _flush_active_recording(self) -> None:
-        if self._recording_file is not None:
-            try:
-                self._recording_file.flush()
-            except Exception:
-                pass
-
     async def _remote_put(self, client: Any, msg: dict[str, Any]) -> None:
-        """Store an uploaded CSV/JSONL telemetry file in self.data_dir."""
-        filename = sanitize_filename(str(msg.get("filename") or ""))
-        if not filename:
-            await self.send_alert(
-                "ERR",
-                "Upload failed: invalid filename.",
-                client=client,
-            )
-            return
-
-        if Path(filename).suffix == "":
-            filename = f"{filename}.csv"
-        elif Path(filename).suffix.lower() not in (".csv", ".jsonl"):
-            await self.send_alert(
-                "ERR",
-                f"Upload failed: unsupported file type for {filename}.",
-                client=client,
-            )
-            return
-
+        raw_name = str(msg.get("filename") or "")
         content = msg.get("content")
         if not isinstance(content, str):
             await self.send_alert(
-                "ERR",
-                "Upload failed: missing or invalid file content.",
-                client=client,
+                "ERR", "Upload failed: missing or invalid file content.", client=client
             )
             return
-
-        if self._recording_active and self._recording_filename == filename:
-            await self.send_alert(
-                "ERR",
-                f"Upload failed: {filename} is currently being recorded.",
-                client=client,
-            )
-            return
-
-        target = self.data_dir / filename
-        overwrote = target.exists()
         try:
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            logger.info(
-                "Stored uploaded remote file: %s (%d bytes, overwrote=%s)",
-                filename,
-                len(content.encode("utf-8")),
-                overwrote,
-            )
-        except Exception as exc:
-            logger.error("Failed storing uploaded file %s: %s", target, exc)
-            await self.send_alert(
-                "ERR",
-                f"Failed to store {filename} on valve cart: {exc}",
-                client=client,
-            )
+            result = await self.api_upload_data_file(raw_name, content)
+        except (ValueError, PermissionError, OSError) as exc:
+            await self.send_alert("ERR", f"Upload failed: {exc}", client=client)
             return
 
-        await self.broadcast(self._build_remote_data_list_payload())
-        suffix = " (overwrote existing)" if overwrote else ""
+        suffix = " (overwrote existing)" if result["overwrote"] else ""
         await self.send_alert(
             "INFO",
-            f'Stored "{filename}" on the valve cart{suffix}.',
+            f'Stored "{result["filename"]}" on the valve cart{suffix}.',
             client=client,
         )
 
     async def _remote_rename(self, client: Any, msg: dict[str, Any]) -> None:
-        old_name = sanitize_filename(str(msg.get("old_name") or ""))
-        new_name = sanitize_filename(str(msg.get("new_name") or ""))
-        if not old_name or not new_name:
-            await self.send_alert(
-                "ERR",
-                "Rename failed: invalid source or target filename.",
-                client=client,
-            )
-            return
-
-        old_path = self.data_dir / old_name
-        new_path = self.data_dir / new_name
-        if not old_path.exists():
-            await self.send_alert(
-                "ERR",
-                f"Rename failed: {old_name} does not exist.",
-                client=client,
-            )
-            return
-        if new_path.exists() and old_path != new_path:
-            await self.send_alert(
-                "ERR",
-                f"Rename failed: {new_name} already exists.",
-                client=client,
-            )
-            return
-
+        old_raw = str(msg.get("old_name") or "")
+        new_raw = str(msg.get("new_name") or "")
         try:
-            old_path.rename(new_path)
-            if self._recording_filename == old_name:
-                self._recording_filename = new_name
-            logger.info("Renamed remote file %s -> %s", old_name, new_name)
-        except Exception as exc:
-            logger.error("Rename failed %s -> %s: %s", old_name, new_name, exc)
+            await self.api_rename_data_file(old_raw, new_raw)
+        except (ValueError, FileNotFoundError, FileExistsError, OSError) as exc:
             await self.send_alert("ERR", f"Rename failed: {exc}", client=client)
-            return
-
-        await self.broadcast(self._build_remote_data_list_payload())
 
     async def _remote_delete(self, client: Any, msg: dict[str, Any]) -> None:
-        filename = sanitize_filename(str(msg.get("filename") or ""))
-        if not filename:
-            await self.send_alert(
-                "WARN", "Delete ignored: invalid filename.", client=client
-            )
-            return
-
-        target = self.data_dir / filename
+        raw_name = str(msg.get("filename") or "")
         try:
-            if target.exists() and target.is_file():
-                target.unlink()
-                logger.info("Deleted remote data file: %s", filename)
-            else:
-                logger.debug("Delete skipped for missing file %s", filename)
-        except Exception as exc:
-            logger.error("Failed deleting %s: %s", filename, exc)
+            await self.api_delete_data_file(raw_name)
+        except FileNotFoundError:
+            logger.debug("Delete skipped for missing file %s", raw_name)
+        except (ValueError, PermissionError, OSError) as exc:
             await self.send_alert(
-                "WARN", f"Could not delete {filename}: {exc}", client=client
+                "WARN", f"Could not delete {raw_name}: {exc}", client=client
             )
-            return
-
-        await self.broadcast(self._build_remote_data_list_payload())
 
     # ------------------------------------------------------------------
-    # Client Connection Lifecycle
+    # FastAPI Application & Routes
+    # ------------------------------------------------------------------
+    async def _http_download_data_file(self, filename: str) -> Any:
+        try:
+            filepath = self.api_resolve_download(filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(filepath, filename=filepath.name, media_type="text/csv")
+
+    async def _http_upload_data_file(
+        self, filename: str, request: Request
+    ) -> dict[str, Any]:
+        chunks = [chunk async for chunk in request.stream()]
+        try:
+            return await self.api_upload_data_chunks(filename, chunks)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def _http_rename_data_file(
+        self, filename: str, request: Request
+    ) -> dict[str, Any]:
+        try:
+            body = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+        new_name = body.get("new_name") if isinstance(body, dict) else None
+        if not isinstance(new_name, str) or not new_name.strip():
+            raise HTTPException(status_code=400, detail="Missing 'new_name'")
+        try:
+            return await self.api_rename_data_file(filename, new_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def _http_delete_data_file(self, filename: str) -> dict[str, Any]:
+        try:
+            return await self.api_delete_data_file(filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def _register_http_routes(self, app: Any) -> None:
+        server = self
+
+        @app.get("/api/data")
+        async def list_data_files() -> dict[str, Any]:
+            return server.api_list_data_files()
+
+        @app.get("/api/data/{filename}")
+        async def download_data_file(filename: str) -> Any:
+            return await server._http_download_data_file(filename)
+
+        @app.put("/api/data/{filename}")
+        async def upload_data_file(filename: str, request: Request) -> dict[str, Any]:
+            return await server._http_upload_data_file(filename, request)
+
+        @app.post("/api/data/{filename}/rename")
+        async def rename_data_file(filename: str, request: Request) -> dict[str, Any]:
+            return await server._http_rename_data_file(filename, request)
+
+        @app.delete("/api/data/{filename}")
+        async def delete_data_file(filename: str) -> dict[str, Any]:
+            return await server._http_delete_data_file(filename)
+
+    async def _handle_fastapi_ws(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        label = self._client_label(websocket)
+        self.clients.add(websocket)
+        logger.info(
+            "Client connected from %s on path '/ws' (total clients: %d)",
+            label,
+            len(self.clients),
+        )
+        try:
+            await self.send_init(websocket)
+            while True:
+                raw_message = await websocket.receive_text()
+                if raw_message:
+                    await self.handle_message(websocket, raw_message)
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            logger.error("Unexpected error in client handler (%s): %s", label, exc)
+        finally:
+            self.clients.discard(websocket)
+            logger.info(
+                "Client disconnected: %s (remaining clients: %d)",
+                label,
+                len(self.clients),
+            )
+
+    def _register_ws_routes(self, app: Any) -> None:
+        server = self
+
+        @app.websocket("/ws")
+        async def ws_endpoint(websocket: WebSocket) -> None:
+            await server._handle_fastapi_ws(websocket)
+
+    def create_app(self) -> Any:
+        """Build the FastAPI application serving `/ws` and `/api/data/...`."""
+        if not HAS_FASTAPI or FastAPI is None:
+            raise RuntimeError("fastapi and uvicorn are required for create_app().")
+
+        app = FastAPI(title="Flow Control System Server", version="0.2.0")
+        self._register_http_routes(app)
+        self._register_ws_routes(app)
+        return app
+
+    # ------------------------------------------------------------------
+    # Legacy WebSocket Connection Lifecycle Fallback
     # ------------------------------------------------------------------
     @staticmethod
     def _client_label(client: Any) -> str:
-        addr = getattr(client, "remote_address", None)
+        addr = getattr(client, "remote_address", None) or getattr(
+            client, "client", None
+        )
         return str(addr) if addr else repr(client)
 
     @staticmethod
@@ -916,7 +861,7 @@ class FlowControlWSServer:
     async def _ws_client_handler(
         self, client: Any, legacy_path: str | None = None
     ) -> None:
-        """Handle an individual WebSocket client lifecycle."""
+        """Handle an individual legacy `websockets` client lifecycle."""
         path = self._extract_request_path(client, legacy_path)
         label = self._client_label(client)
         self.clients.add(client)
@@ -926,7 +871,6 @@ class FlowControlWSServer:
             path,
             len(self.clients),
         )
-
         try:
             await self.send_init(client)
             async for raw_message in client:
@@ -1001,36 +945,67 @@ class FlowControlWSServer:
         if self._stop_event is not None and not self._stop_event.is_set():
             self._stop_event.set()
 
-    async def serve_forever(self, enable_stdin: bool = True) -> None:
-        """Start the WebSocket server and run until stopped."""
-        self._stop_event = asyncio.Event()
+    async def _serve_uvicorn(self) -> None:
+        assert self._stop_event is not None and uvicorn is not None
+        config = uvicorn.Config(
+            self.create_app(),
+            host=self.host,
+            port=self.port,
+            log_level="info",
+            ws_max_size=16 * 1024 * 1024,
+        )
+        uv_server = uvicorn.Server(config)
+        uv_server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+        serve_task = asyncio.create_task(uv_server.serve())
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        done, _ = await asyncio.wait(
+            {serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if stop_task in done:
+            uv_server.should_exit = True
+            await serve_task
+        else:
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
 
+    async def serve_forever(self, enable_stdin: bool = True) -> None:
+        """Start the HTTP/WebSocket server and run until stopped."""
+        self._stop_event = asyncio.Event()
         if enable_stdin and sys.stdin and sys.stdin.isatty():
             self._background_tasks.append(
                 asyncio.create_task(self._interactive_stdin_loop())
             )
 
         logger.info(
-            "Starting FlowControlWSServer on ws://%s:%d/ws (armed=%s, actuators=%d)",
+            "Starting FlowControlWSServer on http://%s:%d (/ws, /api/data) "
+            "(armed=%s, actuators=%d, sensors=%d)",
             self.host,
             self.port,
             self.armed,
             len(self.actuators),
+            len(self.sensors_config.sensors),
         )
 
         try:
-            async with _ws_serve(
-                self._ws_client_handler,
-                self.host,
-                self.port,
-                max_size=16 * 1024 * 1024,
-            ):
-                await self._stop_event.wait()
+            if HAS_FASTAPI and uvicorn is not None:
+                await self._serve_uvicorn()
+            elif _ws_serve is not None:
+                async with _ws_serve(
+                    self._ws_client_handler,
+                    self.host,
+                    self.port,
+                    max_size=16 * 1024 * 1024,
+                ):
+                    await self._stop_event.wait()
+            else:
+                raise RuntimeError(
+                    "Neither uvicorn/fastapi nor websockets is installed."
+                )
         finally:
             await self.shutdown()
 
     async def shutdown(self) -> None:
-        """Cancel background tasks, close recordings and client sockets."""
+        """Cancel background tasks, close recordings, and close client sockets."""
         for task in self._background_tasks:
             if not task.done():
                 task.cancel()
@@ -1038,8 +1013,8 @@ class FlowControlWSServer:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._background_tasks.clear()
 
-        if self._recording_active:
-            self._stop_builtin_recording()
+        if self.is_recording and hasattr(self.data_recorder, "stop_recording"):
+            self.data_recorder.stop_recording()
 
         for client in list(self.clients):
             try:

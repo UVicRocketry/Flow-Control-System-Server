@@ -204,7 +204,7 @@ sudo_cmd usermod -aG dialout "${REMOTE_USER}" 2>/dev/null || true
 sudo_cmd usermod -aG adm "${REMOTE_USER}" 2>/dev/null || true
 
 echo "--> Verifying installed Python modules on ${REMOTE_TARGET} ..."
-"${VENV_PY}" -c "import websockets, serial, u6; print('SUCCESS: websockets, pyserial, and LabJackPython (u6) imported cleanly!')"
+"${VENV_PY}" -c "import fastapi, uvicorn, pydantic, websockets, serial, u6; print('SUCCESS: fastapi, uvicorn, pydantic, websockets, pyserial, and LabJackPython (u6) imported cleanly!')"
 
 rm -rf "${remote_tmp}"
 EOF

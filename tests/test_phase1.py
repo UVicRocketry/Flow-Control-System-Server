@@ -82,8 +82,8 @@ class TestThermocoupleConversion(unittest.TestCase):
         self.assertTrue(math.isfinite(t_100c))
 
     def test_out_of_range_voltages_return_zero(self) -> None:
-        self.assertEqual(thermocouple.V_to_C(-0.02, 0.0), 0.0)
-        self.assertEqual(thermocouple.V_to_K(0.10, 0.0), 0.0)
+        self.assertTrue(math.isnan(thermocouple.V_to_C(-0.02, 0.0)))
+        self.assertTrue(math.isnan(thermocouple.V_to_K(0.10, 0.0)))
 
 
 class TestMockStateTransitions(unittest.TestCase):
