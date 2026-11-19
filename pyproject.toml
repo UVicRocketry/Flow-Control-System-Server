@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Rocketry Flow Control System Server"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic>=2.6.0",
     "websockets>=12.0",
     "pyserial>=3.5",
     "LabJackPython>=2.1.0",
@@ -17,6 +20,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "httpx>=0.27.0",
     "ruff>=0.4",
 ]
 
@@ -32,16 +36,14 @@ max-complexity = 15
 
 [tool.ruff.lint.isort]
 known-first-party = [
+    "data_recorder",
     "instrumentation",
     "mocks",
+    "sensors_config",
     "serial_controller",
     "thermocouple",
     "ws_server",
 ]
-
-[tool.ruff.lint.per-file-ignores]
-"contents/code/instrumentation.py" = ["C901", "F401", "W291", "W293"]
-"contents/code/main.py" = ["C901"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

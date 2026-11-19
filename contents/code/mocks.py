@@ -77,7 +77,7 @@ class MockHardwareSimulator:
         self._actuation_tasks: dict[str, asyncio.Task[Any]] = {}
         self._telemetry_task: asyncio.Task[Any] | None = None
 
-        # Simulated sensor state in client engineering units (kPa, °C, N)
+        # Simulated sensor state in client engineering units (kPa, kg, °C, N)
         self._sim_state: dict[str, float] = {
             "P_RUN_TANK": 101.3,
             "P_INJECTOR": 101.3,
@@ -88,7 +88,7 @@ class MockHardwareSimulator:
             "T_INJECTOR": 21.0,
             "T_COMB_CHMBR": 22.0,
             "T_POST_COMB": 21.5,
-            "L_RUN_TANK": 55.2,
+            "M_RUN_TANK": 5.6,
             "L_THRUST": 0.0,
         }
 
@@ -223,14 +223,14 @@ class MockHardwareSimulator:
             (target_n2_flow - s["P_N2_FLOW"]) * min(1.0, dt * 3.0)
         )
 
-        # Run tank pressure [kPa] & propellant weight [N] response
+        # Run tank pressure [kPa] & propellant mass [kg] response
         if n2ov_open and rtv_state == "FILL" and not dump_open:
             s["P_RUN_TANK"] = min(5205.0, s["P_RUN_TANK"] + 448.0 * dt)
-            s["L_RUN_TANK"] = min(215.7, s["L_RUN_TANK"] + 8.0 * dt)
+            s["M_RUN_TANK"] = min(22.0, s["M_RUN_TANK"] + 0.8 * dt)
             s["T_RUN_TANK"] += (16.5 - s["T_RUN_TANK"]) * min(1.0, dt * 0.8)
         elif dump_open or rtv_state == "VENT":
             s["P_RUN_TANK"] = max(101.3, s["P_RUN_TANK"] - 758.0 * dt)
-            s["L_RUN_TANK"] = max(53.4, s["L_RUN_TANK"] - 9.8 * dt)
+            s["M_RUN_TANK"] = max(5.4, s["M_RUN_TANK"] - 1.0 * dt)
             s["T_RUN_TANK"] += (8.0 - s["T_RUN_TANK"]) * min(1.0, dt * 0.5)
         else:
             s["T_RUN_TANK"] += (20.5 - s["T_RUN_TANK"]) * min(1.0, dt * 0.1)
@@ -238,7 +238,7 @@ class MockHardwareSimulator:
         # Engine / injector / chamber response when MEV is open or fired
         if mev_active and s["P_RUN_TANK"] > 206.8:
             s["P_RUN_TANK"] = max(101.3, s["P_RUN_TANK"] - 586.0 * dt)
-            s["L_RUN_TANK"] = max(44.5, s["L_RUN_TANK"] - 15.6 * dt)
+            s["M_RUN_TANK"] = max(4.5, s["M_RUN_TANK"] - 1.6 * dt)
             target_inj = s["P_RUN_TANK"] * 0.78
             target_cc = s["P_RUN_TANK"] * 0.58
             target_thrust = max(0.0, (target_cc - 101.3) * 0.61)
@@ -292,7 +292,7 @@ class MockHardwareSimulator:
             "T_INJECTOR": round(s["T_INJECTOR"] + _noise(0.05), 2),
             "T_COMB_CHMBR": round(s["T_COMB_CHMBR"] + _noise(0.15), 2),
             "T_POST_COMB": round(s["T_POST_COMB"] + _noise(0.12), 2),
-            "L_RUN_TANK": round(max(0.0, s["L_RUN_TANK"] + _noise(0.13)), 2),
+            "M_RUN_TANK": round(max(0.0, s["M_RUN_TANK"] + _noise(0.02)), 2),
             "L_THRUST": round(max(0.0, s["L_THRUST"] + _noise(0.65)), 2),
         }
 

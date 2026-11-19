@@ -19,6 +19,9 @@ Currently, [`contents/code/main.py`](../contents/code/main.py) is a stub (`print
    - Phased engineering plan to build out `Flow-Control-System-Server/contents/code/` from the reference modules in `PDP-Monitoring-System` and `PDP-Ground-Support-Rewrite`.
    - Module breakdown, unit conversion formulas, simulation/mock mode (`--mock`), on-cart telemetry logging, remote file transfer handlers, and hardware-in-the-loop verification.
 
+3. **[WebSocket Protocol Specification (`websocket-protocol.md`)](./websocket-protocol.md)**
+   - Complete Server $\leftrightarrow$ Client JSON/JSONL wire contract (`init`/`actuators`/`config`, `telemetry`, `valve_state`/`summary`, `armed`, `alert`, `command`, `abort`, `record`, `remote_data_req`/`remote_data_list`/`remote_data_content`), state normalization, and the **Deferred File Deletion Protocol**.
+
 ---
 
 ## Hardware & Network Topology

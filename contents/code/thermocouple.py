@@ -9,6 +9,8 @@ voltage-to-temperature conversions in Celsius (`V_to_C`) and Kelvin (`V_to_K`).
 
 from __future__ import annotations
 
+import math
+
 
 def get_ref_voltage(T_cold_junction_K: float) -> float:
     """
@@ -54,6 +56,8 @@ def V_to_C(tc_voltage: float, ref_voltage: float) -> float:
     to temperature in degrees Celsius (°C).
     """
     voltage = float(tc_voltage) + float(ref_voltage)
+    if not math.isfinite(voltage):
+        return math.nan
 
     # NIST ITS-90 inverse polynomial ranges (in Volts, for -200 °C to 1372 °C)
     if 0.020644 <= voltage <= 0.054886:
@@ -90,7 +94,7 @@ def V_to_C(tc_voltage: float, ref_voltage: float) -> float:
         C8 = 0.000001057734
         C9 = -0.00000001052755
     else:
-        return 0.0
+        return math.nan
 
     # Coeffs expect mV
     mV_voltage = voltage * 1000.0
@@ -114,7 +118,7 @@ def V_to_K(tc_voltage: float, ref_voltage: float) -> float:
     Convert cold-junction-compensated Type-K thermocouple voltage (in Volts)
     to temperature in Kelvin (K).
     """
-    voltage = float(tc_voltage) + float(ref_voltage)
-    if voltage < -0.005891 or voltage > 0.054886:
-        return 0.0
-    return V_to_C(tc_voltage, ref_voltage) + 273.15
+    temp_c = V_to_C(tc_voltage, ref_voltage)
+    if math.isnan(temp_c):
+        return math.nan
+    return temp_c + 273.15

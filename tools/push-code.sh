@@ -50,7 +50,7 @@ if [[ -d "${VENDOR_WHEELS_DIR}" && -n "$(ls -A "${VENDOR_WHEELS_DIR}" 2>/dev/nul
     HAS_LOCAL_WHEELS=1
 fi
 
-if ! run_ssh "test -x '${REMOTE_VENV}/bin/python' && '${REMOTE_VENV}/bin/python' -c 'import websockets, serial, u6' >/dev/null 2>&1"; then
+if ! run_ssh "test -x '${REMOTE_VENV}/bin/python' && '${REMOTE_VENV}/bin/python' -c 'import fastapi, uvicorn, pydantic, websockets, serial, u6' >/dev/null 2>&1"; then
     run_ssh "if [[ ! -x '${REMOTE_VENV}/bin/python' ]]; then python3 -m venv --system-site-packages '${REMOTE_VENV}'; fi"
     if [[ "${HAS_LOCAL_WHEELS}" == "1" ]]; then
         REMOTE_WHEEL_TMP="/tmp/fcs-push-wheels"

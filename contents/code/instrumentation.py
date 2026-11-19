@@ -4,22 +4,29 @@
 LabJack U6 Telemetry Acquisition (`instrumentation.py`) for
 Flow-Control-System-Server.
 
-Streams 11 analog channels (5 pressures in kPa, 2 load cells in N,
-4 Type-K thermocouples in °C) from a LabJack U6 at full packet rate
-(~83.3 Hz at 1000 Hz scan frequency / 12 samples per packet) in a dedicated
-background thread and forwards every packet directly to `FlowControlWSServer`
-for on-cart CSV recording and live WebSocket broadcast.
+Streams 11 analog channels (5 pressures in kPa, 1 runtank mass load cell in kg,
+1 thrust load cell in N, 4 Type-K thermocouples in °C) from a LabJack U6 at full
+packet rate (~83.3 Hz at 1000 Hz scan frequency / 12 samples per packet) in a
+dedicated background thread, recording every full-rate packet via `DataRecorder`
+while decimating live WebSocket broadcasts to `--rate` Hz.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from thermocouple import V_to_C, V_to_K, get_ref_voltage
+from sensors_config import (
+    GAIN_BITMASKS,
+    MODE_BITMASKS,
+    SensorsConfig,
+    load_sensors_config,
+)
+from thermocouple import V_to_C, get_ref_voltage
 
 try:
     import u6  # type: ignore
@@ -32,36 +39,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger("fcs.instrumentation")
 
 # Gains
-X1    = 0b00000000
-X10   = 0b00010000
-X100  = 0b00100000
-X1000 = 0b00110000
+X1 = GAIN_BITMASKS[1]
+X10 = GAIN_BITMASKS[10]
+X100 = GAIN_BITMASKS[100]
+X1000 = GAIN_BITMASKS[1000]
 
 # Channel mode
-SING = 0b00000000
-DIFF = 0b10000000
+SING = MODE_BITMASKS["SING"]
+DIFF = MODE_BITMASKS["DIFF"]
 
 
-'''
+"""
 NOTE:
-  Only change the values between
-  ######### BEGIN USER ADJUSTABLE ########
-
-  #########  END USER ADJUSTABLE  ########
-
-  (If you add a new sensor you will need to adjust other code too)
+  Channel pin assignments, gains, scales, offsets, and stream timing are now
+  configured in `contents/config/sensors.json` (and validated at startup by
+  `sensors_config.py`). See "Adding or Updating a Sensor" below.
 
 
 Overview:
 
-  LabJackPython provides wraps the low level functions for communicating
-  with the labjack so it can be used with python. All of the low level
-  functions are discussed in section 5.2 of the U6 user guide.
+  LabJackPython wraps the low-level functions for communicating with the
+  LabJack U6 in Python. All of the low-level functions are discussed in
+  section 5.2 of the LabJack U6 user guide.
 
-  This file sets up the LJ in stream mode to acquire data at the fastest
-  rate possible. All channels and their settings for each sensor are 
-  configured here. Data produced by the LJ is consumed and streamed to
-  the WebSocket server and on-cart session recorder.
+  This module configures the U6 in stream mode to acquire data at the fastest
+  rate possible in a dedicated USB reader thread. Full-rate packets are
+  logged directly on disk by `DataRecorder`, while live WebSocket broadcasts
+  to the operator GUI are decimated to `--rate` Hz.
 
 
 Sensor Overview:
@@ -76,143 +80,124 @@ Sensor Overview:
   a very small full scale range. Supplied with 5VDC.
 
 
-streamConfig():
+streamConfig() / `sensors.json` -> `"stream"` settings:
 
   Streaming data from the LJ is the fastest way to acquire data.
-  See section 5.2.12 for StreamConfig documentation for details.
+  See section 5.2.12 of the U6 user guide for StreamConfig details.
 
   samples_per_packet:
     The number of samples in each packet sent over USB by the LJ. If the
-    number of channels being scanned is low, then this number should be
-    set lower than the default of 25, otherwise the packet frequency will
-    be lower than desirable. If the number of channels is high then the number
-    should be left at 25 or increased.
+    number of channels being scanned is low, set this lower than the default
+    of 25 so packet frequency stays responsive. Must always be >= len(sensors).
 
   scan_frequency:
-    The frequency in Hz to scan the channel list (ChannelNumbers). 
+    The frequency in Hz to scan the channel list (ChannelNumbers).
     The sample rate (Hz) = scan_frequency * num_channels.
 
   num_channels:
-    Number of channels to stream. Equal to length of channel_numbers.
+    Derived automatically from `len(sensors)` in `sensors.json`.
 
   resolution_index:
-    See section 3.1. Higher values increase ENOB but at the expense
-    of longer sample times.
+    See section 3.1 of the U6 user guide. Higher values increase ENOB at the
+    expense of longer sample times.
 
   settling_factor:
-    For high impedance sensors, a longer settling time is required to acquire
-    enough charge in the ADC to get an accurate reading. LJ says that the
-    auto setting is good for any sensor with at most 1000 ohm output 
-    impedance. 
-    See https://support.labjack.com/docs/analog-input-settling-time-app-note
- 
-  channel_settings[]:
-    Channels to read from and their settings. For differential pairs, only
-    specify the positive channel (even numbered). OR a channel mode and 
-    gain value together to conveniently set the options for that channel.
+    For high-impedance sensors, a longer settling time is required to acquire
+    enough charge in the ADC for an accurate reading. LJ notes that the auto
+    setting works well up to 1000 ohm output impedance:
+    https://support.labjack.com/docs/analog-input-settling-time-app-note
 
-    Each channel has options that can be set with the ChannelOptions byte.
-    These options should be configured for each type of sensor to account
-    for their output impedance, fullscale range etc. Each bit of the byte
-    configures a different setting:
+  channel_settings (built from `pin`, `mode`, and `gain_index` in `sensors.json`):
+    For differential pairs, specify only the positive channel (`pin`) with
+    `"mode": "DIFF"`; the LabJack automatically pairs the negative channel
+    (extended mux channels e.g. 81, 83, 85, 87 are valid differential pins).
+    Options byte encoding in the LabJack U6 hardware:
 
-      Set bit 4-5 = GainIndex:
+      Set bits 4-5 = GainIndex:
         GainIndex   Gain   Max V    Min V
         b00         1      10.1     -10.6
         b01         10     1.01     -1.06
         b10         100    0.101    -0.106
         b11         1000   0.0101   -0.0106
-    
-      Set bit 7 for differential reading.
+
+      Set bit 7 for differential reading (`DIFF = 0x80`, `SING = 0x00`).
 
 
-Adding a Sensor: 
-    1) Add a new tuple to channel_settings with the LJ pin the sensor is
-       connected to. For single ended sensors, this is just the single
-       sensor pin. For differential, it is the positive channel. LJ will
-       automatically configure the negative channel.
+Adding or Updating a Sensor:
 
-       The tuple should have the form: (CHAN_NUM, SETTINGS)
-       Ex: Channel 0 single ended with gain 10:  (0, SING | X10)
-           Channel 2,3 differential with gain 1: (2, DIFF | X1)
+  All LabJack channel definitions live in `contents/config/sensors.json`:
+    1) Add or update an object in the `"sensors"` array with:
+         {
+           "id": "P_NEW_SENSOR",
+           "pin": 88,
+           "mode": "DIFF",      // "DIFF" or "SING"
+           "gain_index": 100,   // 1, 10, 100, or 1000
+           "scale": 140000.0,   // linear multiplier; omit for Type-K TCs
+           "offset": 0.0,       // optional zero offset (defaults to 0.0)
+           "unit": "kPa"        // engineering/CSV unit ("kPa", "N", or "C")
+         }
+    2) For Type-K thermocouples, give `"unit": "C"` (or an `id` starting with
+       `"T_"`). `convert_stream_values()` automatically applies cold-junction
+       compensated `V_to_C()` instead of `scale * V + offset`.
+    3) Ensure `"samples_per_packet"` in `"stream"` is >= total sensor count.
+    4) `channel_settings`, `convert_stream_values()`, CSV recording headers, and
+       WS `init` channel metadata automatically update from `sensors.json`—no
+       changes to `instrumentation.py` or `data_recorder.py` are needed.
+"""
 
-    2) Add a new GAIN variable and OFFSET variable if needed that converts
-       the raw voltage from the sensor to the appropriate unit.
+DEFAULT_SENSORS = load_sensors_config()
+_SENSORS_BY_ID = {s.id: s for s in DEFAULT_SENSORS.sensors}
 
-    3) Add a new variable (called CHAN_XXX where XXX refers to the sensor name)
-       to refer to the pin the sensor is connected to. Again for single ended
-       just use the pin, and differential the positive channel. This is used
-       for lookup in the LJ results dictionary. The LJ naming convention is 
-       'AINX' where X is the pin number (1, 2, .. 56 etc)
+# Module-level compatibility bindings loaded from `contents/config/sensors.json`
+#
+# Calibration reference notes preserved from bench calibration:
+#   - P_* pressures: `2 * 6.895 * <psi_per_v>` converts PSI to kPa (6895 Pa / 1000)
+#     with `*2` because transducers are excited on 5V supply rather than 10V.
+#   - P_COMB_CHMBR: gain 0.0 (`2 * 6.895 * 0.0`) — TODO: Not in use.
+#   - M_RUN_TANK (AIN86, DIFF | X1000): Runtank mass [kg] — SEEMS GOOD. CHECK CAL.
+#   - L_THRUST (AIN87, DIFF | X1000): VERY NOISY (offset -25.8 TODO double check).
+#   - P_INJECTOR (AIN82, DIFF | X100): GOOD!
+scan_frequency = DEFAULT_SENSORS.stream.scan_frequency
+resolution_index = DEFAULT_SENSORS.stream.resolution_index
+settling_factor = DEFAULT_SENSORS.stream.settling_factor
+samples_per_packet = DEFAULT_SENSORS.stream.samples_per_packet
+channel_settings = DEFAULT_SENSORS.channel_settings()
 
-    4) Add a few lines of code to read and convert the voltage in
-       `convert_reading()`:
+GAIN_P_COMB_CHMBR = _SENSORS_BY_ID["P_COMB_CHMBR"].scale  # TODO: Not in use
+GAIN_P_N2O_FLOW = _SENSORS_BY_ID[
+    "P_N2O_FLOW"
+].scale  # [kPa/V] at 5V (2 * 6.895 * 9982.03)
+GAIN_P_N2_FLOW = _SENSORS_BY_ID[
+    "P_N2_FLOW"
+].scale  # [kPa/V] at 5V (2 * 6.895 * 9936.41)
+GAIN_P_RUN_TANK = _SENSORS_BY_ID[
+    "P_RUN_TANK"
+].scale  # [kPa/V] at 5V (2 * 6.895 * 10206.74)
+GAIN_P_INJECTOR = _SENSORS_BY_ID[
+    "P_INJECTOR"
+].scale  # [kPa/V] at 5V (2 * 6.895 * 10170.95)
 
-       if reading is not None:
+GAIN_M_RUN_TANK = _SENSORS_BY_ID["M_RUN_TANK"].scale  # [kg/V] at 5V supply
+GAIN_L_THRUST = _SENSORS_BY_ID["L_THRUST"].scale  # [N/V] at 5V supply
+OFFSET_L_THRUST = _SENSORS_BY_ID["L_THRUST"].offset  # [N] TODO double check
+OFFSET_M_RUN_TANK = _SENSORS_BY_ID["M_RUN_TANK"].offset  # [kg] TODO add
 
-           # Add and fill out this line
-           SENSOR_NAME = values[CHAN_XXX]
-           converted['SENSOR_NAME'] = GAIN*SENSOR_NAME + OFFSET # etc...
-
-        Thats it, Have fun with your new sensor!
-    
-'''
-
-######### BEGIN USER ADJUSTABLE #########
-
-# Stream settings
-scan_frequency   = 1000
-resolution_index = 2
-settling_factor  = 2
-samples_per_packet = 12
-channel_settings = [(86, DIFF | X1000), # L_RUN_TANK (SEEMS GOOD. CHECK CAL)
-                    (87, DIFF | X1000), # L_THRUST (VERY NOISY)
-
-                    (82, DIFF | X100),  # P_INJECTOR (GOOD!)
-                    (85, DIFF | X100),  # P_COMB_CHMBR
-                    (84, DIFF | X100),  # P_N2O_FLOW
-                    (83, DIFF | X100),  # P_N2_FLOW
-                    (81, DIFF | X100),  # P_RUN_TANK
-                    
-                    (55, SING | X100),  # T_COMB_CHMBR
-                    (53, SING | X100),  # T_POST_COMB_CHMBR
-                    (57, SING | X100),  # T_INJECTOR
-                    (49, SING | X100)]  # T_RUN_TANK 
-
-# These gains and offsets convert raw volts to target engineering units
-# (Pressures in kPa, Loads in N, Temperatures in °C)
-
-# 6.895 converts PSI to kPa (6895 Pa / 1000). *2 since running on 5V supply rather than 10V
-GAIN_P_COMB_CHMBR = 2 * 6.895 * 0.0       # [kPa/V] at 10V supply TODO: Not in use
-GAIN_P_N2O_FLOW   = 2 * 6.895 * 9982.03   # [kPa/V] at 10V supply 
-GAIN_P_N2_FLOW    = 2 * 6.895 * 9936.41   # [kPa/V] at 10V supply
-GAIN_P_RUN_TANK   = 2 * 6.895 * 10206.74  # [kPa/V] at 10V supply
-GAIN_P_INJECTOR   = 2 * 6.895 * 10170.95  # [kPa/V] at 10V supply
-
-GAIN_L_RUN_TANK   = 2014.22   # [N/V]  at 5V supply
-GAIN_L_THRUST     = 466000    # [N/V]  at 5V supply 
-
-OFFSET_L_THRUST   = -25.8     # [N] # TODO double check
-OFFSET_L_RUN_TANK = -5.8      # [N] # TODO add 
-
-# Channel mapping from LJ to sensor
-CHAN_L_RUN_TANK   = 'AIN86'
-CHAN_L_THRUST     = 'AIN87'
-
-CHAN_P_COMB_CHMBR = 'AIN85'
-CHAN_P_N2O_FLOW   = 'AIN84'
-CHAN_P_N2_FLOW    = 'AIN83'
-CHAN_P_RUN_TANK   = 'AIN81'
-CHAN_P_INJECTOR   = 'AIN82'
-
-CHAN_T_RUN_TANK   = 'AIN49'
-CHAN_T_INJECTOR   = 'AIN57'
-CHAN_T_COMB_CHMBR = 'AIN55'
-CHAN_T_POST_COMB  = 'AIN53'
-
-CHAN_SHUNT        = 'AIN82' # Not implemented yet on cart
-
-#########  END USER ADJUSTABLE  #########
+CHAN_M_RUN_TANK = _SENSORS_BY_ID["M_RUN_TANK"].ain_key
+CHAN_L_THRUST = _SENSORS_BY_ID["L_THRUST"].ain_key
+# Backwards-compatible aliases
+GAIN_L_RUN_TANK = GAIN_M_RUN_TANK
+OFFSET_L_RUN_TANK = OFFSET_M_RUN_TANK
+CHAN_L_RUN_TANK = CHAN_M_RUN_TANK
+CHAN_P_COMB_CHMBR = _SENSORS_BY_ID["P_COMB_CHMBR"].ain_key
+CHAN_P_N2O_FLOW = _SENSORS_BY_ID["P_N2O_FLOW"].ain_key
+CHAN_P_N2_FLOW = _SENSORS_BY_ID["P_N2_FLOW"].ain_key
+CHAN_P_RUN_TANK = _SENSORS_BY_ID["P_RUN_TANK"].ain_key
+CHAN_P_INJECTOR = _SENSORS_BY_ID["P_INJECTOR"].ain_key
+CHAN_T_RUN_TANK = _SENSORS_BY_ID["T_RUN_TANK"].ain_key
+CHAN_T_INJECTOR = _SENSORS_BY_ID["T_INJECTOR"].ain_key
+CHAN_T_COMB_CHMBR = _SENSORS_BY_ID["T_COMB_CHMBR"].ain_key
+CHAN_T_POST_COMB = _SENSORS_BY_ID["T_POST_COMB"].ain_key
+CHAN_SHUNT = "AIN82"  # Not implemented yet on cart
 
 
 def _mean(samples: list[float]) -> float:
@@ -224,26 +209,13 @@ def convert_stream_values(
     v_ref: float,
     packet_id: int | None = None,
     uptime: float | None = None,
+    sensors_config: SensorsConfig | None = None,
 ) -> dict[str, Any]:
     """
     Convert a processed LabJack stream packet (`values = d.processStreamData(...)`)
-    into a flat telemetry sample dictionary with pressures in kPa, loads in N,
-    and temperatures in °C.
+    into a flat telemetry sample dictionary driven by `sensors.json`.
     """
-    P_INJECTOR   = values[CHAN_P_INJECTOR]
-    P_COMB_CHMBR = values[CHAN_P_COMB_CHMBR]
-    P_N2O_FLOW   = values[CHAN_P_N2O_FLOW]
-    P_N2_FLOW    = values[CHAN_P_N2_FLOW]
-    P_RUN_TANK   = values[CHAN_P_RUN_TANK]
-
-    L_RUN_TANK   = values[CHAN_L_RUN_TANK]
-    L_THRUST     = values[CHAN_L_THRUST]
-
-    T_RUN_TANK   = values[CHAN_T_RUN_TANK]
-    T_INJECTOR   = values[CHAN_T_INJECTOR]
-    T_COMB_CHMBR = values[CHAN_T_COMB_CHMBR]
-    T_POST_COMB  = values[CHAN_T_POST_COMB]
-
+    cfg = sensors_config or DEFAULT_SENSORS
     converted: dict[str, Any] = {}
     if packet_id is not None:
         converted["packet_id"] = packet_id
@@ -252,26 +224,12 @@ def convert_stream_values(
         converted["seconds"] = rounded_t
         converted["uptime"] = rounded_t
 
-    # Pressures [kPa]
-    converted["P_INJECTOR"] = _mean(P_INJECTOR) * GAIN_P_INJECTOR
-    converted["P_COMB_CHMBR"] = _mean(P_COMB_CHMBR) * GAIN_P_COMB_CHMBR
-    converted["P_N2O_FLOW"] = _mean(P_N2O_FLOW) * GAIN_P_N2O_FLOW
-    converted["P_N2_FLOW"] = _mean(P_N2_FLOW) * GAIN_P_N2_FLOW
-    converted["P_RUN_TANK"] = _mean(P_RUN_TANK) * GAIN_P_RUN_TANK
-
-    # Load cells [N]
-    converted["L_RUN_TANK"] = (
-        _mean(L_RUN_TANK) * GAIN_L_RUN_TANK + OFFSET_L_RUN_TANK
-    )
-    converted["L_THRUST"] = (
-        _mean(L_THRUST) * GAIN_L_THRUST + OFFSET_L_THRUST
-    )
-
-    # Thermocouples [°C]
-    converted["T_RUN_TANK"] = V_to_C(_mean(T_RUN_TANK), v_ref)
-    converted["T_INJECTOR"] = V_to_C(_mean(T_INJECTOR), v_ref)
-    converted["T_COMB_CHMBR"] = V_to_C(_mean(T_COMB_CHMBR), v_ref)
-    converted["T_POST_COMB"] = V_to_C(_mean(T_POST_COMB), v_ref)
+    for sensor in cfg.sensors:
+        mean_v = _mean(values.get(sensor.ain_key, []))
+        if sensor.is_thermocouple:
+            converted[sensor.id] = V_to_C(mean_v, v_ref)
+        else:
+            converted[sensor.id] = mean_v * sensor.scale + sensor.offset
 
     return converted
 
@@ -301,9 +259,8 @@ class LabJackInstrumentation:
     """
     Full-rate LabJack U6 stream reader for `FlowControlWSServer`.
 
-    Runs the synchronous `u6.U6.streamData(convert=False)` loop in a dedicated
-    background thread and forwards every converted sample packet directly to
-    the asyncio event loop for CSV recording and WebSocket broadcast.
+    Writes every packet when recording is active (~83.3 Hz) while decimating
+    live WebSocket broadcasts to `broadcast_rate_hz`.
     """
 
     def __init__(
@@ -311,13 +268,25 @@ class LabJackInstrumentation:
         ws_server: FlowControlWSServer,
         reconnect_delay: float = 2.0,
         max_queue_size: int = 512,
+        broadcast_rate_hz: float = 20.0,
+        sensors_config: SensorsConfig | None = None,
+        tc_alert_interval_sec: float = 10.0,
     ):
         self.ws_server = ws_server
         self.reconnect_delay = max(0.5, float(reconnect_delay))
         self.max_queue_size = max(16, int(max_queue_size))
+        self.broadcast_rate_hz = max(1.0, float(broadcast_rate_hz))
+        self.sensors_config = (
+            sensors_config
+            or getattr(ws_server, "sensors_config", None)
+            or DEFAULT_SENSORS
+        )
+        self.tc_alert_interval_sec = max(0.0, float(tc_alert_interval_sec))
 
         self._start_mono: float = time.monotonic()
         self._packet_id: int = 0
+        self._last_broadcast_mono: float = 0.0
+        self._last_tc_alert_mono: float = 0.0
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._consumer_task: asyncio.Task[Any] | None = None
@@ -330,16 +299,18 @@ class LabJackInstrumentation:
     def start(self) -> None:
         """Start the background LabJack stream thread and asyncio consumer."""
         if u6 is None:
-            raise RuntimeError(
-                "LabJackPython ('u6' module) is not installed."
-            )
-        if samples_per_packet < len(channel_settings):
+            raise RuntimeError("LabJackPython ('u6' module) is not installed.")
+        spp = self.sensors_config.stream.samples_per_packet
+        n_sensors = len(self.sensors_config.sensors)
+        if spp < n_sensors:
             raise ValueError(
-                f"samples_per_packet ({samples_per_packet}) must be at least "
-                f"the number of channels ({len(channel_settings)})!"
+                f"samples_per_packet ({spp}) must be at least "
+                f"the number of channels ({n_sensors})!"
             )
 
         self._start_mono = time.monotonic()
+        self._last_broadcast_mono = 0.0
+        self._last_tc_alert_mono = 0.0
         self._stop_event.clear()
         self._loop = asyncio.get_running_loop()
         self._sample_queue = asyncio.Queue(maxsize=self.max_queue_size)
@@ -371,8 +342,57 @@ class LabJackInstrumentation:
             self._consumer_task = None
 
     # ------------------------------------------------------------------
-    # Cross-Thread Sample & Alert Forwarding
+    # Cross-Thread Sample, Thermocouple Fault & Decimated Broadcasts
     # ------------------------------------------------------------------
+    def find_faulted_thermocouples(self, sample: dict[str, Any]) -> list[str]:
+        """Return thermocouple channel IDs whose converted value is NaN."""
+        return [
+            s.id
+            for s in self.sensors_config.sensors
+            if s.is_thermocouple
+            and isinstance(sample.get(s.id), float)
+            and math.isnan(sample[s.id])
+        ]
+
+    async def _maybe_emit_tc_fault_alert(
+        self, sample: dict[str, Any], now_mono: float
+    ) -> None:
+        faulted = self.find_faulted_thermocouples(sample)
+        if not faulted:
+            return
+        if (
+            self._last_tc_alert_mono == 0.0
+            or (now_mono - self._last_tc_alert_mono) >= self.tc_alert_interval_sec
+        ):
+            self._last_tc_alert_mono = now_mono
+            await self.ws_server.send_alert(
+                "WARN",
+                f"Thermocouple out-of-range / open-circuit on: {', '.join(faulted)}",
+            )
+
+    async def process_sample(
+        self, sample: dict[str, Any], now_mono: float | None = None
+    ) -> bool:
+        """
+        Record full-rate packets on disk, emit rate-limited thermocouple fault
+        alerts, and decimate WebSocket broadcasts to `broadcast_rate_hz`.
+        """
+        now = time.monotonic() if now_mono is None else float(now_mono)
+        if self.ws_server.is_recording:
+            self.ws_server.record_telemetry(sample)
+
+        await self._maybe_emit_tc_fault_alert(sample, now)
+
+        min_interval = 1.0 / self.broadcast_rate_hz
+        if self.ws_server.clients and (
+            self._last_broadcast_mono == 0.0
+            or (now - self._last_broadcast_mono) >= min_interval
+        ):
+            self._last_broadcast_mono = now
+            await self.ws_server.broadcast_telemetry(sample, record=False)
+            return True
+        return False
+
     def _enqueue_sample_on_loop(self, sample: dict[str, Any]) -> None:
         if self._sample_queue is None:
             return
@@ -402,8 +422,7 @@ class LabJackInstrumentation:
         try:
             while True:
                 sample = await self._sample_queue.get()
-                if self.ws_server.clients or self.ws_server.is_recording:
-                    await self.ws_server.broadcast_telemetry(sample)
+                await self.process_sample(sample)
         except asyncio.CancelledError:
             logger.debug("LabJack telemetry consumer loop stopped.")
             raise
@@ -419,14 +438,16 @@ class LabJackInstrumentation:
         except Exception:
             pass
 
+        stream_cfg = self.sensors_config.stream
+        settings = self.sensors_config.channel_settings()
         d.streamConfig(
-            ScanFrequency=scan_frequency,
-            ChannelNumbers=[x[0] for x in channel_settings],
-            ChannelOptions=[x[1] for x in channel_settings],
-            NumChannels=len(channel_settings),
-            ResolutionIndex=resolution_index,
-            SettlingFactor=settling_factor,
-            SamplesPerPacket=samples_per_packet,
+            ScanFrequency=stream_cfg.scan_frequency,
+            ChannelNumbers=[x[0] for x in settings],
+            ChannelOptions=[x[1] for x in settings],
+            NumChannels=len(settings),
+            ResolutionIndex=stream_cfg.resolution_index,
+            SettlingFactor=stream_cfg.settling_factor,
+            SamplesPerPacket=stream_cfg.samples_per_packet,
         )
 
         t_ref_k = d.getTemperature()
@@ -434,65 +455,73 @@ class LabJackInstrumentation:
         logger.info(
             "LabJack U6 configured (scan=%d Hz, channels=%d, spp=%d, "
             "T_ref=%.2f K / %.2f °C, V_ref=%.6f V)",
-            scan_frequency,
-            len(channel_settings),
-            samples_per_packet,
+            stream_cfg.scan_frequency,
+            len(settings),
+            stream_cfg.samples_per_packet,
             t_ref_k,
             t_ref_k - 273.15,
             v_ref,
         )
         return d, v_ref
 
+    def _stream_device_packets(self, device: Any, v_ref: float) -> None:
+        for reading in device.streamData(convert=False):
+            if self._stop_event.is_set():
+                break
+            if not reading or not reading.get("result"):
+                continue
+
+            if reading.get("errors", 0) or reading.get("missed", 0):
+                logger.debug(
+                    "LabJack stream packet diagnostic: errors=%s, missed=%s",
+                    reading.get("errors"),
+                    reading.get("missed"),
+                )
+
+            values = device.processStreamData(reading["result"])
+            self._packet_id += 1
+            uptime = time.monotonic() - self._start_mono
+            sample = convert_stream_values(
+                values=values,
+                v_ref=v_ref,
+                packet_id=self._packet_id,
+                uptime=uptime,
+                sensors_config=self.sensors_config,
+            )
+
+            if self._loop is not None and not self._loop.is_closed():
+                self._loop.call_soon_threadsafe(self._enqueue_sample_on_loop, sample)
+
+    @staticmethod
+    def _close_device(device: Any | None, stream_started: bool) -> None:
+        if device is None:
+            return
+        if stream_started:
+            try:
+                device.streamStop()
+                logger.info("LabJack U6 stream stopped.")
+            except Exception:
+                pass
+        try:
+            device.close()
+        except Exception:
+            pass
+
     def _stream_thread_main(self) -> None:
         had_failure = False
         while not self._stop_event.is_set():
-            d = None
+            device = None
             stream_started = False
             try:
-                d, v_ref = self._open_and_configure_device()
-                d.streamStart()
+                device, v_ref = self._open_and_configure_device()
+                device.streamStart()
                 stream_started = True
-
                 if had_failure:
                     had_failure = False
                     self._emit_alert_threadsafe(
                         "INFO", "LabJack U6 telemetry stream reconnected."
                     )
-
-                for reading in d.streamData(convert=False):
-                    if self._stop_event.is_set():
-                        break
-                    if reading is None:
-                        continue
-
-                    if reading.get("errors", 0) or reading.get("missed", 0):
-                        logger.debug(
-                            "LabJack stream packet diagnostic: "
-                            "errors=%s, missed=%s",
-                            reading.get("errors"),
-                            reading.get("missed"),
-                        )
-
-                    result = reading.get("result")
-                    if not result:
-                        continue
-
-                    values = d.processStreamData(result)
-                    self._packet_id += 1
-                    uptime = time.monotonic() - self._start_mono
-
-                    sample = convert_stream_values(
-                        values=values,
-                        v_ref=v_ref,
-                        packet_id=self._packet_id,
-                        uptime=uptime,
-                    )
-
-                    if self._loop is not None and not self._loop.is_closed():
-                        self._loop.call_soon_threadsafe(
-                            self._enqueue_sample_on_loop, sample
-                        )
-
+                self._stream_device_packets(device, v_ref)
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
@@ -506,17 +535,7 @@ class LabJackInstrumentation:
                     )
                 self._stop_event.wait(self.reconnect_delay)
             finally:
-                if d is not None:
-                    if stream_started:
-                        try:
-                            d.streamStop()
-                            logger.info("LabJack U6 stream stopped.")
-                        except Exception:
-                            pass
-                    try:
-                        d.close()
-                    except Exception:
-                        pass
+                self._close_device(device, stream_started)
 
 
 if __name__ == "__main__":

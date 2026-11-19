@@ -1,0 +1,96 @@
+{
+    "stream": {
+        "scan_frequency": 1000,
+        "resolution_index": 2,
+        "settling_factor": 2,
+        "samples_per_packet": 12
+    },
+    "sensors": [
+        {
+            "id": "P_INJECTOR",
+            "pin": 82,
+            "mode": "DIFF",
+            "gain_index": 100,
+            "scale": 140257.4005,
+            "unit": "kPa"
+        },
+        {
+            "id": "P_COMB_CHMBR",
+            "pin": 85,
+            "mode": "DIFF",
+            "gain_index": 100,
+            "scale": 0.0,
+            "unit": "kPa"
+        },
+        {
+            "id": "P_N2O_FLOW",
+            "pin": 84,
+            "mode": "DIFF",
+            "gain_index": 100,
+            "scale": 137652.1937,
+            "unit": "kPa"
+        },
+        {
+            "id": "P_N2_FLOW",
+            "pin": 83,
+            "mode": "DIFF",
+            "gain_index": 100,
+            "scale": 137023.0939,
+            "unit": "kPa"
+        },
+        {
+            "id": "P_RUN_TANK",
+            "pin": 81,
+            "mode": "DIFF",
+            "gain_index": 100,
+            "scale": 140750.9446,
+            "unit": "kPa"
+        },
+        {
+            "id": "M_RUN_TANK",
+            "pin": 86,
+            "mode": "DIFF",
+            "gain_index": 1000,
+            "scale": 2014.22,
+            "offset": -5.8,
+            "unit": "kg"
+        },
+        {
+            "id": "L_THRUST",
+            "pin": 87,
+            "mode": "DIFF",
+            "gain_index": 1000,
+            "scale": 466000.0,
+            "offset": -25.8,
+            "unit": "N"
+        },
+        {
+            "id": "T_RUN_TANK",
+            "pin": 49,
+            "mode": "SING",
+            "gain_index": 100,
+            "unit": "C"
+        },
+        {
+            "id": "T_INJECTOR",
+            "pin": 57,
+            "mode": "SING",
+            "gain_index": 100,
+            "unit": "C"
+        },
+        {
+            "id": "T_COMB_CHMBR",
+            "pin": 55,
+            "mode": "SING",
+            "gain_index": 100,
+            "unit": "C"
+        },
+        {
+            "id": "T_POST_COMB",
+            "pin": 53,
+            "mode": "SING",
+            "gain_index": 100,
+            "unit": "C"
+        }
+    ]
+}
