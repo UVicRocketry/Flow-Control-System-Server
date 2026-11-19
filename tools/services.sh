@@ -4,111 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-REMOTE_USER="${REMOTE_USER:-uvr}"
-REMOTE_HOST="${REMOTE_HOST:-192.168.0.1}"
-REMOTE_PORT="${REMOTE_PORT:-22}"
-REMOTE_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
+source "${SCRIPT_DIR}/_common.sh"
+
 SERVICE_NAME="${SERVICE_NAME:-flow-control-server.service}"
 JOURNAL_LINES="${JOURNAL_LINES:-50}"
-
-# Locate the gitignored password file (checks tools/password.txt then repo-root password.txt)
-if [[ -z "${PASSWORD_FILE:-}" ]]; then
-    if [[ -f "${SCRIPT_DIR}/password.txt" ]]; then
-        PASSWORD_FILE="${SCRIPT_DIR}/password.txt"
-    elif [[ -f "${REPO_ROOT}/password.txt" ]]; then
-        PASSWORD_FILE="${REPO_ROOT}/password.txt"
-    else
-        PASSWORD_FILE="${SCRIPT_DIR}/password.txt"
-    fi
-fi
-
-if [[ ! -f "${PASSWORD_FILE}" ]]; then
-    echo "Error: Password file not found at '${PASSWORD_FILE}'." >&2
-    echo "Create '${SCRIPT_DIR}/password.txt' (or '${REPO_ROOT}/password.txt') with the SSH/sudo password for ${REMOTE_TARGET}." >&2
-    exit 1
-fi
-
-SSH_PASSWORD="$(tr -d '\r\n' < "${PASSWORD_FILE}")"
-if [[ -z "${SSH_PASSWORD}" ]]; then
-    echo "Error: Password file '${PASSWORD_FILE}' is empty." >&2
-    exit 1
-fi
-
-# Create a temporary SSH_ASKPASS helper and ControlMaster socket directory
-ASKPASS_SCRIPT="$(mktemp)"
-CTL_DIR="$(mktemp -d)"
-cleanup() {
-    ssh -O exit -o ControlPath="${CTL_DIR}/mux" "${REMOTE_TARGET}" 2>/dev/null || true
-    rm -rf "${ASKPASS_SCRIPT}" "${CTL_DIR}"
-}
-trap cleanup EXIT
-
-cat > "${ASKPASS_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-if [[ "\${1:-}" == *"yes/no"* ]]; then
-    printf 'yes\n'
-else
-    printf '%s\n' $(printf '%q' "${SSH_PASSWORD}")
-fi
-EOF
-chmod 700 "${ASKPASS_SCRIPT}"
-
-export SSH_ASKPASS="${ASKPASS_SCRIPT}"
-export SSH_ASKPASS_REQUIRE=force
-export DISPLAY="${DISPLAY:-:0}"
-
-SSH_OPTS=(
-    -4
-    -p "${REMOTE_PORT}"
-    -o StrictHostKeyChecking=accept-new
-    -o GSSAPIAuthentication=no
-    -o PreferredAuthentications=password,keyboard-interactive
-    -o PubkeyAuthentication=no
-    -o ConnectTimeout=5
-    -o ControlMaster=auto
-    -o ControlPath="${CTL_DIR}/mux"
-    -o ControlPersist=60
-)
-
-if [[ "${SSH_VERBOSE:-0}" == "1" ]]; then
-    SSH_OPTS+=(-v)
-fi
-
-run_ssh() {
-    if command -v sshpass >/dev/null 2>&1; then
-        sshpass -p "${SSH_PASSWORD}" ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "$@"
-    else
-        ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" "$@"
-    fi
-}
-
-run_remote_sudo() {
-    local escaped_pw
-    escaped_pw="$(printf '%q' "${SSH_PASSWORD}")"
-    run_ssh "printf '%s\n' ${escaped_pw} | sudo -S -p '' $*"
-}
-
-check_tcp_port() {
-    local host="$1"
-    local port="$2"
-    if command -v nc >/dev/null 2>&1; then
-        nc -z -w 2 "${host}" "${port}" >/dev/null 2>&1
-    else
-        timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
-    fi
-}
-
-is_valve_cart_reachable() {
-    check_tcp_port "${REMOTE_HOST}" "${REMOTE_PORT}" && run_ssh "true" >/dev/null 2>&1
-}
-
-require_connection() {
-    if ! is_valve_cart_reachable; then
-        echo "Error: Cannot connect to valve cart at ${REMOTE_TARGET} (port ${REMOTE_PORT})." >&2
-        echo "Ensure the valve cart is powered on and reachable (or run tools/direct-ethernet.sh if connected directly)." >&2
-        return 1
-    fi
-}
 
 usage() {
     cat <<EOF
@@ -242,6 +141,7 @@ do_push_deps() {
     fi
 
     echo "==> Installing Python dependencies & LabJack permissions on ${REMOTE_TARGET} (offline) ..."
+    init_ssh
     local escaped_pw
     escaped_pw="$(printf '%q' "${SSH_PASSWORD}")"
     run_ssh "bash -s" <<EOF
@@ -251,14 +151,26 @@ sudo_cmd() {
     printf '%s\n' ${escaped_pw} | sudo -S -p '' "\$@"
 }
 
-PIP_EXTRA_ARGS=()
-if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then
-    PIP_EXTRA_ARGS+=(--break-system-packages)
+VENV_PY="python3"
+mkdir -p "${REMOTE_DIR}"
+if [[ ! -x "${REMOTE_VENV}/bin/python" ]]; then
+    python3 -m venv --system-site-packages "${REMOTE_VENV}" || true
+fi
+if [[ -x "${REMOTE_VENV}/bin/python" ]]; then
+    VENV_PY="${REMOTE_VENV}/bin/python"
 fi
 
-echo "--> Installing Python packages for user '${REMOTE_USER}' and system service ..."
-python3 -m pip install --user --no-index --find-links "${remote_tmp}/wheels" "\${PIP_EXTRA_ARGS[@]}" -r "${remote_tmp}/requirements.txt" || \
-    sudo_cmd python3 -m pip install --no-index --find-links "${remote_tmp}/wheels" "\${PIP_EXTRA_ARGS[@]}" -r "${remote_tmp}/requirements.txt"
+echo "--> Installing Python packages into '${REMOTE_VENV}' (offline wheelhouse) ..."
+if [[ "${VENV_PY}" != "python3" ]]; then
+    "${VENV_PY}" -m pip install --no-index --find-links "${remote_tmp}/wheels" -r "${remote_tmp}/requirements.txt"
+else
+    PIP_EXTRA_ARGS=()
+    if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then
+        PIP_EXTRA_ARGS+=(--break-system-packages)
+    fi
+    python3 -m pip install --user --no-index --find-links "${remote_tmp}/wheels" "\${PIP_EXTRA_ARGS[@]}" -r "${remote_tmp}/requirements.txt" || \
+        sudo_cmd python3 -m pip install --no-index --find-links "${remote_tmp}/wheels" "\${PIP_EXTRA_ARGS[@]}" -r "${remote_tmp}/requirements.txt"
+fi
 
 if [[ -d "${remote_tmp}/exodriver/liblabjackusb" ]]; then
     if ! ldconfig -p 2>/dev/null | grep -q liblabjackusb; then
@@ -292,7 +204,7 @@ sudo_cmd usermod -aG dialout "${REMOTE_USER}" 2>/dev/null || true
 sudo_cmd usermod -aG adm "${REMOTE_USER}" 2>/dev/null || true
 
 echo "--> Verifying installed Python modules on ${REMOTE_TARGET} ..."
-python3 -c "import websockets, serial, u6; print('SUCCESS: websockets, pyserial, and LabJackPython (u6) imported cleanly!')"
+"${VENV_PY}" -c "import websockets, serial, u6; print('SUCCESS: websockets, pyserial, and LabJackPython (u6) imported cleanly!')"
 
 rm -rf "${remote_tmp}"
 EOF

@@ -7,11 +7,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-REMOTE_USER="${REMOTE_USER:-uvr}"
-REMOTE_HOST="${REMOTE_HOST:-192.168.0.1}"
-REMOTE_PORT="${REMOTE_PORT:-22}"
-REMOTE_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
-REMOTE_DIR="${REMOTE_DIR:-/home/${REMOTE_USER}/Flow-Control-System-Server}"
+source "${SCRIPT_DIR}/_common.sh"
+
 DETECT_SERVICE_NAME="${DETECT_SERVICE_NAME:-flow-control-direct-eth.service}"
 
 CLIENT_IFACE="${CLIENT_IFACE:-}"
@@ -20,98 +17,6 @@ NET_PREFIX="${NET_PREFIX:-24}"
 NM_CON_NAME="${NM_CON_NAME:-fcs-direct-eth}"
 WS_PORT="${WS_PORT:-8080}"
 STATE_FILE="${STATE_FILE:-/tmp/fcs-direct-eth-client.state}"
-
-# Locate the gitignored password file (checks tools/password.txt then repo-root password.txt)
-if [[ -z "${PASSWORD_FILE:-}" ]]; then
-    if [[ -f "${SCRIPT_DIR}/password.txt" ]]; then
-        PASSWORD_FILE="${SCRIPT_DIR}/password.txt"
-    elif [[ -f "${REPO_ROOT}/password.txt" ]]; then
-        PASSWORD_FILE="${REPO_ROOT}/password.txt"
-    else
-        PASSWORD_FILE="${SCRIPT_DIR}/password.txt"
-    fi
-fi
-
-SSH_PASSWORD=""
-ASKPASS_SCRIPT=""
-CTL_DIR=""
-
-cleanup() {
-    if [[ -n "${CTL_DIR}" && -S "${CTL_DIR}/mux" ]]; then
-        ssh -O exit -o ControlPath="${CTL_DIR}/mux" "${REMOTE_TARGET}" 2>/dev/null || true
-    fi
-    rm -rf "${ASKPASS_SCRIPT}" "${CTL_DIR}" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-init_ssh() {
-    if [[ ! -f "${PASSWORD_FILE}" ]]; then
-        echo "Error: Password file not found at '${PASSWORD_FILE}'." >&2
-        echo "Create '${SCRIPT_DIR}/password.txt' (or '${REPO_ROOT}/password.txt') with the SSH/sudo password for ${REMOTE_TARGET}." >&2
-        return 1
-    fi
-
-    SSH_PASSWORD="$(tr -d '\r\n' < "${PASSWORD_FILE}")"
-    if [[ -z "${SSH_PASSWORD}" ]]; then
-        echo "Error: Password file '${PASSWORD_FILE}' is empty." >&2
-        return 1
-    fi
-
-    if [[ -z "${ASKPASS_SCRIPT}" ]]; then
-        ASKPASS_SCRIPT="$(mktemp)"
-        CTL_DIR="$(mktemp -d)"
-        cat > "${ASKPASS_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-if [[ "\${1:-}" == *"yes/no"* ]]; then
-    printf 'yes\n'
-else
-    printf '%s\n' $(printf '%q' "${SSH_PASSWORD}")
-fi
-EOF
-        chmod 700 "${ASKPASS_SCRIPT}"
-    fi
-
-    export SSH_ASKPASS="${ASKPASS_SCRIPT}"
-    export SSH_ASKPASS_REQUIRE=force
-    export DISPLAY="${DISPLAY:-:0}"
-}
-
-ssh_opts() {
-    local opts=(
-        -4
-        -o "Port=${REMOTE_PORT}"
-        -o StrictHostKeyChecking=accept-new
-        -o GSSAPIAuthentication=no
-        -o PreferredAuthentications=password,keyboard-interactive
-        -o PubkeyAuthentication=no
-        -o ConnectTimeout=5
-        -o ControlMaster=auto
-        -o ControlPath="${CTL_DIR}/mux"
-        -o ControlPersist=60
-    )
-    if [[ "${SSH_VERBOSE:-0}" == "1" ]]; then
-        opts+=(-v)
-    fi
-    printf '%s\n' "${opts[@]}"
-}
-
-run_ssh() {
-    init_ssh || return 1
-    local opts=()
-    mapfile -t opts < <(ssh_opts)
-    if command -v sshpass >/dev/null 2>&1; then
-        sshpass -p "${SSH_PASSWORD}" ssh "${opts[@]}" "${REMOTE_TARGET}" "$@"
-    else
-        ssh "${opts[@]}" "${REMOTE_TARGET}" "$@"
-    fi
-}
-
-run_remote_sudo() {
-    init_ssh || return 1
-    local escaped_pw
-    escaped_pw="$(printf '%q' "${SSH_PASSWORD}")"
-    run_ssh "printf '%s\n' ${escaped_pw} | sudo -S -p '' $*"
-}
 
 usage() {
     cat <<EOF
@@ -184,16 +89,6 @@ nm_manages_iface() {
     local state
     state="$(nmcli -t -f DEVICE,STATE device status 2>/dev/null | awk -F: -v d="${iface}" '$1 == d {print $2; exit}')"
     [[ -n "${state}" && "${state}" != "unmanaged" ]]
-}
-
-check_tcp_port() {
-    local host="$1"
-    local port="$2"
-    if command -v nc >/dev/null 2>&1; then
-        nc -z -w 2 "${host}" "${port}" >/dev/null 2>&1
-    else
-        timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
-    fi
 }
 
 do_initiate() {
@@ -384,17 +279,8 @@ do_install_server() {
 
     echo "==> Deploying direct-Ethernet detector to ${REMOTE_TARGET}..."
     run_ssh "mkdir -p '${REMOTE_DIR}/contents/code' '${REMOTE_DIR}/contents/config'"
-
-    init_ssh
-    local opts=()
-    mapfile -t opts < <(ssh_opts)
-    if command -v sshpass >/dev/null 2>&1; then
-        sshpass -p "${SSH_PASSWORD}" scp "${opts[@]}" "${local_script}" "${REMOTE_TARGET}:${REMOTE_DIR}/contents/code/direct-eth-detect.sh"
-        sshpass -p "${SSH_PASSWORD}" scp "${opts[@]}" "${local_unit}" "${REMOTE_TARGET}:${REMOTE_DIR}/contents/config/${DETECT_SERVICE_NAME}"
-    else
-        scp "${opts[@]}" "${local_script}" "${REMOTE_TARGET}:${REMOTE_DIR}/contents/code/direct-eth-detect.sh"
-        scp "${opts[@]}" "${local_unit}" "${REMOTE_TARGET}:${REMOTE_DIR}/contents/config/${DETECT_SERVICE_NAME}"
-    fi
+    run_scp_to "${local_script}" "${REMOTE_DIR}/contents/code/direct-eth-detect.sh"
+    run_scp_to "${local_unit}" "${REMOTE_DIR}/contents/config/${DETECT_SERVICE_NAME}"
 
     echo "==> Installing and enabling '${DETECT_SERVICE_NAME}' on ${REMOTE_TARGET}..."
     run_remote_sudo "chmod +x '${REMOTE_DIR}/contents/code/direct-eth-detect.sh'"
