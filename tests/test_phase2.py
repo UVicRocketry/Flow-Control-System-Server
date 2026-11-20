@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 CODE_DIR = str(Path(__file__).resolve().parents[1] / "contents" / "code")
 if CODE_DIR not in sys.path:
@@ -334,6 +335,173 @@ class TestDataRecorderAndHttpApi(unittest.IsolatedAsyncioTestCase):
                 init_msg = ws.receive_json()
                 self.assertEqual(init_msg["type"], "init")
                 self.assertIn("P_RUN_TANK", init_msg["channels"])
+
+
+class _FakeU6Device:
+    """In-memory LabJack U6 stub tracking lifecycle calls."""
+
+    def __init__(self, *, fail_on_config: bool = False) -> None:
+        self.fail_on_config = fail_on_config
+        self.calls: list[str] = []
+
+    def streamStop(self) -> None:
+        self.calls.append("streamStop")
+
+    def streamConfig(self, **_kwargs) -> None:
+        self.calls.append("streamConfig")
+        if self.fail_on_config:
+            raise RuntimeError("config failed")
+
+    def getTemperature(self) -> float:
+        self.calls.append("getTemperature")
+        return 298.15
+
+    def streamStart(self) -> None:
+        self.calls.append("streamStart")
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+
+class _FakeAsyncWSClient(_RecordingClient):
+    """Async-iterable WebSocket stub that yields scripted frames or raises."""
+
+    def __init__(
+        self,
+        server: ws_server.FlowControlWSServer,
+        items: list[str | Exception],
+    ) -> None:
+        super().__init__()
+        self._server = server
+        self._items = list(items)
+        self.seen_registered_on_iter = False
+        self.path = "/ws"
+
+    def __aiter__(self) -> "_FakeAsyncWSClient":
+        return self
+
+    async def __anext__(self) -> str:
+        if self in self._server.clients:
+            self.seen_registered_on_iter = True
+        if not self._items:
+            raise StopAsyncIteration
+        nxt = self._items.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+class TestContextManagerDecorators(unittest.IsolatedAsyncioTestCase):
+    """Tests stdlib @contextmanager and @asynccontextmanager helpers."""
+
+    def test_open_stream_context_manager_lifecycle_and_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = ws_server.FlowControlWSServer(data_dir=tmpdir)
+            inst = instrumentation.LabJackInstrumentation(ws_server=server)
+            created: list[_FakeU6Device] = []
+            fail_next = False
+
+            def _make_u6() -> _FakeU6Device:
+                dev = _FakeU6Device(fail_on_config=fail_next)
+                created.append(dev)
+                return dev
+
+            fake_u6 = mock.Mock(U6=_make_u6)
+            with mock.patch.object(instrumentation, "u6", fake_u6):
+                with inst._open_stream() as (device, v_ref):
+                    self.assertIs(device, created[-1])
+                    self.assertAlmostEqual(v_ref, thermocouple.get_ref_voltage(298.15))
+                self.assertEqual(
+                    created[-1].calls,
+                    [
+                        "streamStop",
+                        "streamConfig",
+                        "getTemperature",
+                        "streamStart",
+                        "streamStop",
+                        "close",
+                    ],
+                )
+
+                with self.assertRaises(RuntimeError):
+                    with inst._open_stream():
+                        raise RuntimeError("stream read error")
+                self.assertEqual(
+                    created[-1].calls,
+                    [
+                        "streamStop",
+                        "streamConfig",
+                        "getTemperature",
+                        "streamStart",
+                        "streamStop",
+                        "close",
+                    ],
+                )
+
+                fail_next = True
+                with self.assertRaises(RuntimeError):
+                    with inst._open_stream():
+                        pass
+                self.assertEqual(
+                    created[-1].calls,
+                    ["streamStop", "streamConfig", "close"],
+                )
+
+    def test_translate_http_data_errors_mapping(self) -> None:
+        class _FakeHTTPException(Exception):
+            def __init__(self, status_code: int, detail: str) -> None:
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        cases = [
+            (ValueError("bad name"), 400),
+            (FileNotFoundError("missing.csv"), 404),
+            (PermissionError("recording active"), 409),
+            (FileExistsError("already exists"), 409),
+        ]
+        with mock.patch.object(ws_server, "HTTPException", _FakeHTTPException):
+            for err, expected_status in cases:
+                with self.assertRaises(_FakeHTTPException) as ctx:
+                    with ws_server.FlowControlWSServer._translate_http_data_errors():
+                        raise err
+                self.assertEqual(ctx.exception.status_code, expected_status)
+                self.assertEqual(ctx.exception.detail, str(err))
+
+    async def test_track_client_session_via_ws_client_handler(self) -> None:
+        class _FakeDisconnect(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl = _DummySerialController()
+            server = ws_server.FlowControlWSServer(
+                armed=True, data_dir=tmpdir, serial_controller=ctrl
+            )
+            with mock.patch.object(ws_server, "_WSConnectionClosed", _FakeDisconnect):
+                disconnecting = _FakeAsyncWSClient(
+                    server,
+                    [
+                        json.dumps(
+                            {"type": "command", "valve": "N2OV", "action": "OPEN"}
+                        ),
+                        _FakeDisconnect("client closed"),
+                    ],
+                )
+                await server._ws_client_handler(disconnecting)
+                self.assertTrue(disconnecting.seen_registered_on_iter)
+                self.assertEqual(disconnecting.messages[0]["type"], "init")
+                self.assertEqual(ctrl.commands, [("N2OV", "OPEN")])
+                self.assertNotIn(disconnecting, server.clients)
+
+                crashing = _FakeAsyncWSClient(server, [RuntimeError("unexpected")])
+                with self.assertLogs("fcs.ws_server", level="ERROR") as logs:
+                    await server._ws_client_handler(crashing)
+                self.assertTrue(crashing.seen_registered_on_iter)
+                self.assertEqual(crashing.messages[0]["type"], "init")
+                self.assertNotIn(crashing, server.clients)
+                self.assertTrue(
+                    any("Unexpected error in client handler" in msg for msg in logs.output)
+                )
 
 
 if __name__ == "__main__":

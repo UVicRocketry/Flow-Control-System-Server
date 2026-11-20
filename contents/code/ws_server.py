@@ -19,7 +19,8 @@ import inspect
 import json
 import logging
 import sys
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -724,25 +725,30 @@ class FlowControlWSServer:
     # ------------------------------------------------------------------
     # FastAPI Application & Routes
     # ------------------------------------------------------------------
-    async def _http_download_data_file(self, filename: str) -> Any:
+    @staticmethod
+    @contextmanager
+    def _translate_http_data_errors() -> Iterator[None]:
+        """Translate DataRecorder domain exceptions into FastAPI HTTPException."""
         try:
-            filepath = self.api_resolve_download(filename)
+            yield
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, FileExistsError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def _http_download_data_file(self, filename: str) -> Any:
+        with self._translate_http_data_errors():
+            filepath = self.api_resolve_download(filename)
         return FileResponse(filepath, filename=filepath.name, media_type="text/csv")
 
     async def _http_upload_data_file(
         self, filename: str, request: Request
     ) -> dict[str, Any]:
         chunks = [chunk async for chunk in request.stream()]
-        try:
+        with self._translate_http_data_errors():
             return await self.api_upload_data_chunks(filename, chunks)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except PermissionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def _http_rename_data_file(
         self, filename: str, request: Request
@@ -754,24 +760,12 @@ class FlowControlWSServer:
         new_name = body.get("new_name") if isinstance(body, dict) else None
         if not isinstance(new_name, str) or not new_name.strip():
             raise HTTPException(status_code=400, detail="Missing 'new_name'")
-        try:
+        with self._translate_http_data_errors():
             return await self.api_rename_data_file(filename, new_name)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except FileExistsError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def _http_delete_data_file(self, filename: str) -> dict[str, Any]:
-        try:
+        with self._translate_http_data_errors():
             return await self.api_delete_data_file(filename)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except PermissionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def _register_http_routes(self, app: Any) -> None:
         server = self
@@ -796,32 +790,41 @@ class FlowControlWSServer:
         async def delete_data_file(filename: str) -> dict[str, Any]:
             return await server._http_delete_data_file(filename)
 
-    async def _handle_fastapi_ws(self, websocket: WebSocket) -> None:
-        await websocket.accept()
-        label = self._client_label(websocket)
-        self.clients.add(websocket)
+    @asynccontextmanager
+    async def _track_client_session(
+        self, client: Any, path: str, disconnect_exc: type[BaseException]
+    ) -> AsyncIterator[None]:
+        """Register a WS client, send init, log unexpected errors, and discard on exit."""
+        label = self._client_label(client)
+        self.clients.add(client)
         logger.info(
-            "Client connected from %s on path '/ws' (total clients: %d)",
+            "Client connected from %s on path '%s' (total clients: %d)",
             label,
+            path,
             len(self.clients),
         )
         try:
-            await self.send_init(websocket)
-            while True:
-                raw_message = await websocket.receive_text()
-                if raw_message:
-                    await self.handle_message(websocket, raw_message)
-        except WebSocketDisconnect:
+            await self.send_init(client)
+            yield
+        except disconnect_exc:
             pass
         except Exception as exc:
             logger.error("Unexpected error in client handler (%s): %s", label, exc)
         finally:
-            self.clients.discard(websocket)
+            self.clients.discard(client)
             logger.info(
                 "Client disconnected: %s (remaining clients: %d)",
                 label,
                 len(self.clients),
             )
+
+    async def _handle_fastapi_ws(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        async with self._track_client_session(websocket, "/ws", WebSocketDisconnect):
+            while True:
+                raw_message = await websocket.receive_text()
+                if raw_message:
+                    await self.handle_message(websocket, raw_message)
 
     def _register_ws_routes(self, app: Any) -> None:
         server = self
@@ -864,32 +867,12 @@ class FlowControlWSServer:
     ) -> None:
         """Handle an individual legacy `websockets` client lifecycle."""
         path = self._extract_request_path(client, legacy_path)
-        label = self._client_label(client)
-        self.clients.add(client)
-        logger.info(
-            "Client connected from %s on path '%s' (total clients: %d)",
-            label,
-            path,
-            len(self.clients),
-        )
-        try:
-            await self.send_init(client)
+        async with self._track_client_session(client, path, _WSConnectionClosed):
             async for raw_message in client:
                 if isinstance(raw_message, bytes):
                     raw_message = raw_message.decode("utf-8", errors="replace")
                 if raw_message:
                     await self.handle_message(client, raw_message)
-        except _WSConnectionClosed:
-            pass
-        except Exception as exc:
-            logger.error("Unexpected error in client handler (%s): %s", label, exc)
-        finally:
-            self.clients.discard(client)
-            logger.info(
-                "Client disconnected: %s (remaining clients: %d)",
-                label,
-                len(self.clients),
-            )
 
     # ------------------------------------------------------------------
     # Interactive Terminal Loop (Optional for local debugging)
