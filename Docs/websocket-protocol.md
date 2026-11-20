@@ -1,155 +1,111 @@
-# WebSocket Protocol Specification (Server ↔ Client)
+# WebSocket & HTTP `/api/data` Protocol Specification (Server ↔ Client)
 
-This document specifies the WebSocket server contract and wire protocol that **Flow Control System Server** (`Flow-Control-System-Server`) must implement to communicate with **Flow Control System Client** (`Flow-Control-System-Client`).
+This document specifies the **WebSocket (`WS /ws`)** and **HTTP (`/api/data/...`)** contract implemented by **Flow Control System Server** ([`contents/code/ws_server.py`](../contents/code/ws_server.py)) for **Flow Control System Client** (`Flow-Control-System-Client`).
 
-For hardware serial (`Controls.ino`) and LabJack U6 acquisition details, see [`protocol-and-architecture.md`](./protocol-and-architecture.md).
-
----
-
-## 1. Transport & Endpoint
-
-- **Endpoint:** `ws://0.0.0.0:8080/ws`
-  - Production Valve Cart Mini PC: `ws://192.168.0.1:8080/ws`
-  - Local Development / Mock Server: `ws://127.0.0.1:8080/ws`
-- **Framing:** UTF-8 text frames containing **JSON objects** (or newline-delimited **JSONL** batches for high-rate telemetry).
-- **Multi-Client Support:** The server should maintain a `set` of connected WebSocket clients and broadcast state changes (`telemetry`, `valve_state`, `armed`, `alert`) to all connected clients, while replying directly (or broadcasting where appropriate) to `init` and `remote_data_req` requests.
+For Arduino serial (`Controls.ino`) and LabJack U6 calibration details, see [`protocol-and-architecture.md`](./protocol-and-architecture.md) and [`actuation-spec.md`](./actuation-spec.md).
 
 ---
 
-## 2. End-to-End Server $\leftrightarrow$ Client Message Flow
+## 1. Transport & Endpoints
+
+- **Base Bind:** `http://0.0.0.0:8080`
+  - Valve Cart Mini PC: `ws://192.168.0.1:8080/ws` & `http://192.168.0.1:8080/api/data`
+  - Local Dev / Mock: `ws://127.0.0.1:8080/ws` & `http://127.0.0.1:8080/api/data`
+- **Multi-Client Registry:** Active sockets are tracked in `self.clients: set[Any]`. Outbound telemetry/state broadcasts handle stale disconnects safely without blocking other clients.
+
+---
+
+## 2. End-to-End Message & Request Flow
 
 ```mermaid
 sequenceDiagram
-    participant C as Mission Control Client<br/>(Flow-Control-System-Client)
-    participant S as Valve Cart Server<br/>(Flow-Control-System-Server)
-    participant HW as Hardware Layer<br/>(Arduino Serial & LabJack U6)
+    participant C as Mission Control Client<br/>(QML WS + LogManager NAM)
+    participant S as FastAPI + Uvicorn Server<br/>(ws_server.py :8080)
+    participant D as DataRecorder<br/>(data_recorder.py)
+    participant HW as Hardware / Mock<br/>(LabJack + Serial)
 
-    Note over C,S: Connection & Handshake
-    C->>S: Open WebSocket (/ws)
-    S-->>C: {"type": "init", "armed": false, "actuators": [...], "valves": {...}}
-    C->>S: {"type": "remote_data_req", "operation": "list"}
-    S-->>C: {"type": "remote_data_list", "files": [...]}
+    Note over C,S: Connection, Handshake & HTTP Discovery
+    C->>S: Open WS /ws
+    S-->>C: {"type": "init", "armed": ..., "actuators": [...], "channels": {...}, "valves": {...}}
+    C->>S: GET /api/data
+    S-->>C: {"files": [...], "recording": false, "recording_filename": null}
 
-    Note over C,HW: Live Telemetry Broadcast (10–50 Hz)
-    HW->>S: LabJack U6 Stream (PSI, °C, lbf)
-    S-->>C: {"type": "telemetry", "data": {"seconds": 12.4, "P_RUN_TANK": 725.1, ...}}
+    Note over C,HW: Telemetry Stream (83.3 Hz Disk / 20 Hz Decimated WS)
+    HW->>S: Sample (kPa, kg, N, C)
+    S->>D: Write full-rate CSV row (if recording)
+    S-->>C: {"type": "telemetry", "data": { ... }} (NaN -> null)
 
-    Note over C,HW: Valve / Actuator Actuation
+    Note over C,HW: Actuation & State Sync
     C->>S: {"type": "command", "command": "CTRL", "valve": "N2OV", "action": "OPEN"}
-    S->>HW: MCC,CTRL,N2OV,OPEN\n
-    S-->>C: {"type": "valve_state", "valve": "N2OV", "state": "ACTUATING"}
-    HW-->>S: VC,SUMMARY,...,N2OV,OPEN,...
-    S-->>C: {"type": "valve_state", "valve": "N2OV", "state": "OPEN"}
+    S->>HW: send_valve_command("N2OV", "OPEN")
+    S-->>C: {"type": "valve_state", "valve": "N2OV", "state": "ACTUATING"} -> "OPEN"
 
-    Note over C,S: Deferred File Deletion Commit (on Dashboard close)
-    C->>S: {"type": "remote_data_req", "operation": "delete", "filename": "old_run.csv"}
-    S->>S: Unlink from data/ safely
-    S-->>C: {"type": "remote_data_list", "files": [...]}
+    Note over C,D: Streaming Log CRUD (HTTP /api/data)
+    C->>S: GET /api/data/hotfire.csv
+    S->>D: resolve_download_path() + FileResponse
+    S-->>C: Streaming CSV bytes
 ```
 
 ---
 
 ## 3. Connection Lifecycle Expectations
 
-When a client connects or reconnects, the server should expect the following automatic client behaviors:
-
-1. **Immediate Handshake (`init`):**
-   - Upon accepting a WebSocket connection on `/ws`, the server should immediately send an `"init"` packet containing `"armed"`, `"actuators"` (or `"valve_definitions"`), and current `"valves"` states.
-2. **Automatic Remote File List Request:**
-   - Immediately upon `ws_connected == true`, the client sends `{"type": "remote_data_req", "operation": "list"}`.
-3. **Automatic Recording Re-Sync:**
-   - If the client already has local telemetry recording active when a WebSocket connection is established (or re-established after a drop), the client automatically sends `{"type": "record", "command": "RECORD", "active": true, "session_name": "...", "filename": "..."}`.
-   - The server should idempotently ensure recording is active (avoiding duplicate/corrupted file handles if already recording the same session).
-4. **Disconnect Safety:**
-   - When the WebSocket closes, the client immediately resets its local `armed` state to `false` (SAFE) and emits `disconnected` / `websocket_closed`.
+1. **Immediate Handshake (`init`):** On WS accept, `FlowControlWSServer.send_init()` sends `build_init_payload()` (including `"armed"`, `"recording"`, `"recording_filename"`, `"actuators"`, `"channels"` from `sensors.json`, and `"valves"`), plus any startup `connect_alert` (e.g., mock mode notice).
+2. **Remote File Sync:** Client requests `GET /api/data` (falling back to WS `{"type": "remote_data_req", "operation": "list"}` in WebSocket-only mode).
+3. **Recording Re-Sync:** If the client connects while already recording locally, it emits `{"type": "record", "active": true, "filename": ...}`; if the server is already recording on the same sanitized filename, the server preserves the open CSV file handle idempotently.
 
 ---
 
-## 4. WebSocket Wire Protocol Specification
+## 4. WebSocket Wire Protocol (`WS /ws`)
 
-### 4.1 Server $\rightarrow$ Client Messages
+### 4.1 Server → Client Messages
 
-#### A. Initial State & Actuator Config (`type: "init" | "actuators" | "config"`)
-Sent immediately when a client connects, or whenever the server's actuator configuration changes. Synchronizes armed status, dynamic actuator definitions, and current valve/actuator states.
-
-- `"actuators"` (or `"valve_definitions"`) can also be attached to **any** control message; if present as a list, the client dynamically updates its actuator cards.
-- `"valves"` may be either a state dictionary (`{"ID": "STATE"}`) or, when sent with `"type": "init" | "actuators" | "config"`, a list of actuator definition objects.
-
-- `"recording"` (`bool`, optional) and `"recording_filename"` (or `"active_log"`, `string`, optional): Indicates whether the server is currently recording telemetry. If `"recording": true` when a second client connects, the client prompts the user to either pull the current recorded state (`mode: "pull_recording"`) or wait for recording to stop while logging live telemetry in memory.
-
+#### A. Initial Handshake & Config (`type: "init" | "actuators" | "config"`)
 ```json
 {
   "type": "init",
+  "system": "Flow-Control-System-Server (Mock)",
   "armed": false,
   "recording": false,
   "recording_filename": null,
   "actuators": [
     {
-      "id": "MEV",
-      "label": "Main Engine Valve",
+      "id": "N2OV",
+      "label": "N2O Valve (N2OV)",
       "type": "servo",
       "normal_state": "CLOSED",
-      "key": "M",
-      "hint": "Primary propellant valve",
-      "external": false,
-      "single_use": false
-    },
-    {
-      "id": "N2OV",
-      "label": "N2O Fill / Vent",
-      "type": "solenoid_3way",
-      "normal_state": "VENT",
-      "key": "V",
-      "hint": "3-way fill/vent solenoid",
-      "external": false,
-      "single_use": false
-    },
-    {
-      "id": "QD",
-      "label": "Quick Disconnect",
-      "type": "solenoid_qd",
-      "normal_state": "CONNECTED",
-      "key": "Q",
-      "hint": "Ground umbilical disconnect",
-      "external": true,
-      "single_use": true
-    },
-    {
-      "id": "IGN",
-      "label": "Igniter E-Match",
-      "type": "ematch",
-      "normal_state": "CLOSED",
-      "key": "I",
-      "hint": "Pyro ignition channel",
-      "external": false,
-      "single_use": true
+      "states": ["OPEN", "CLOSED"],
+      "hint": "2 LS",
+      "key": "1"
     }
   ],
+  "channels": {
+    "P_INJECTOR": {"pin": "AIN82", "unit": "kPa", "mode": "DIFF", "gain_index": 100},
+    "P_COMB_CHMBR": {"pin": "AIN85", "unit": "kPa", "mode": "DIFF", "gain_index": 100},
+    "P_N2O_FLOW": {"pin": "AIN84", "unit": "kPa", "mode": "DIFF", "gain_index": 100},
+    "P_N2_FLOW": {"pin": "AIN83", "unit": "kPa", "mode": "DIFF", "gain_index": 100},
+    "P_RUN_TANK": {"pin": "AIN81", "unit": "kPa", "mode": "DIFF", "gain_index": 100},
+    "M_RUN_TANK": {"pin": "AIN86", "unit": "kg", "mode": "DIFF", "gain_index": 1000},
+    "L_THRUST": {"pin": "AIN87", "unit": "N", "mode": "DIFF", "gain_index": 1000},
+    "T_RUN_TANK": {"pin": "AIN49", "unit": "C", "mode": "SING", "gain_index": 100, "thermocouple": true},
+    "T_INJECTOR": {"pin": "AIN57", "unit": "C", "mode": "SING", "gain_index": 100, "thermocouple": true},
+    "T_COMB_CHMBR": {"pin": "AIN55", "unit": "C", "mode": "SING", "gain_index": 100, "thermocouple": true},
+    "T_POST_COMB": {"pin": "AIN53", "unit": "C", "mode": "SING", "gain_index": 100, "thermocouple": true}
+  },
   "valves": {
-    "MEV": "CLOSED",
-    "N2OV": "VENT",
+    "N2OV": "CLOSED",
+    "DUMP": "OPEN",
+    "RTV": "CLOSED",
     "QD": "CONNECTED",
-    "IGN": "CLOSED"
+    "MEV": "READY",
+    "MRV": "READY"
   }
 }
 ```
+Actuator definitions come directly from [`contents/config/actuators.json`](../contents/config/actuators.json) (`N2OV`, `DUMP`, `RTV`, `QD`, `MEV`, `MRV`).
 
-**Actuator Definition Fields:**
-- `id` (`string`): Unique actuator identifier used in commands and state maps.
-- `label` (`string`): Human-readable card title.
-- `type` (`string`): One of `"servo"`, `"solenoid_3way"`, `"solenoid_qd"`, `"ematch"`.
-- `normal_state` (`string`): Expected safe/resting state (`"CLOSED"`, `"VENT"`, `"CONNECTED"`).
-- `key` (`string`): Optional keyboard shortcut hint.
-- `hint` (`string`): Optional description shown on the actuator card.
-- `external` (`bool`): If `true`, actuation is disabled in the client UI (read-only/external hardware).
-- `single_use` (`bool`): If `true`, the client locks out further actuation once expended (`DISCONNECTED` or `FIRED`).
-
-> **Legacy Compatibility (`PDP-Monitoring-System`):** Legacy `{"identifier": "STARTUP", "data": "VC CONNECTED"}` is accepted by the client.
-
-#### B. Live Telemetry Frame (`type: "telemetry"`)
-Broadcasted continuously from the LabJack U6 acquisition loop (or mock generator) in engineering units (`PSI`, `°C`, `lbf`). The client accepts three payload layouts (single JSON frames or newline-delimited JSONL batches):
-
-**Layout 1 — Grouped Sub-Dictionaries:**
+#### B. Live Telemetry (`type: "telemetry"`)
+Broadcasted decimated via `--rate` (default `20.0 Hz`) in engineering units (`kPa`, `kg`, `N`, `C`):
 ```json
 {
   "type": "telemetry",
@@ -157,250 +113,52 @@ Broadcasted continuously from the LabJack U6 acquisition loop (or mock generator
     "packet_id": 1042,
     "seconds": 104.2,
     "uptime": 104.2,
-    "pressures": {
-      "P_RUN_TANK": 742.5,
-      "P_N2O_FLOW": 612.1,
-      "P_N2_FLOW": 795.0,
-      "P_COMB_CHMBR": 418.3,
-      "P_INJECTOR": 538.9
-    },
-    "temperatures": {
-      "T_RUN_TANK": 19.4,
-      "T_INJECTOR": 24.1,
-      "T_COMB_CHMBR": 685.0,
-      "T_POST_COMB": 512.7
-    },
-    "loads": {
-      "L_RUN_TANK": 48.6,
-      "L_THRUST": 412.0
-    }
-  }
-}
-```
-
-**Layout 2 — Flat Channel Dictionary:**
-```json
-{
-  "type": "telemetry",
-  "data": {
-    "seconds": 104.2,
-    "P_RUN_TANK": 742.5,
+    "P_RUN_TANK": 5120.5,
+    "P_INJECTOR": 3715.6,
+    "M_RUN_TANK": 18.4,
+    "L_THRUST": 1680.0,
     "T_RUN_TANK": 19.4,
-    "L_THRUST": 412.0
+    "T_INJECTOR": null
   }
 }
 ```
+`sanitize_telemetry_for_json()` converts non-finite floats (`math.nan`, `inf`) to `null` for strict RFC 8259 JSON encoding (`json.dumps(..., allow_nan=False)`).
 
-**Layout 3 — Raw Telemetry Object (Unwrapped):**
-```json
-{
-  "seconds": 104.2,
-  "P_RUN_TANK": 742.5,
-  "T_RUN_TANK": 19.4
-}
-```
-- Time indexing checks `"seconds"` $\rightarrow$ `"uptime"` $\rightarrow$ `"time"` $\rightarrow$ server/client `time.time()`. Unix epoch timestamps ($>10^6$) are automatically anchored to $t = 0\text{ s}$ on the client.
-- Any unrecognized numeric key is auto-registered by the client with units inferred from its prefix (`P_` $\rightarrow$ `PSI`, `T_` $\rightarrow$ `°C`, `L_` $\rightarrow$ `lbf`).
-
-#### C. Valve State Update (`type: "valve_state" | "summary"`)
-Sent whenever a valve/actuator changes state or in response to a state summary poll.
-```json
-{
-  "type": "valve_state",
-  "valve": "MEV",
-  "state": "OPEN"
-}
-```
-- Supports **single-valve updates** (`"valve"` and `"state"`) and/or **bulk summary updates** (`"valves": {"MEV": "OPEN", "N2OV": "FILL", ...}`).
-- **Client State Normalization:** The client uppercases states and maps firmware/legacy aliases:
-  - `"CLOSE"` $\rightarrow$ `"CLOSED"`
-  - `"TRANSIT"` $\rightarrow$ `"ACTUATING"`
-  - `"FILLING"` $\rightarrow$ `"FILL"`
-  - `"VENTING"` $\rightarrow$ `"VENT"`
-- **Valid Normalized States:**
-  - `servo`: `"OPEN"`, `"CLOSED"`, `"ACTUATING"`
-  - `solenoid_3way`: `"FILL"`, `"VENT"`
-  - `solenoid_qd`: `"CONNECTED"`, `"DISCONNECTED"`
-  - `ematch`: `"CLOSED"`, `"FIRED"`
-
-> **Legacy Compatibility (`PDP-Monitoring-System`):** `{"identifier": "FEEDBACK", "data": {"valve": "MEV", "action": "OPEN"}}` is also accepted.
-
-#### D. Armed State Update (`type: "armed"`)
-Synchronizes the client's **SAFE / ARMED** interlock state:
-```json
-{
-  "type": "armed",
-  "armed": true
-}
-```
-
-#### E. System Alert / Diagnostic Notification (`type: "alert"`)
-Displays a toast notification and logs an entry in the client's Notification Tray:
-```json
-{
-  "type": "alert",
-  "level": "WARN",
-  "message": "Hardware keyswitch is in SAFE lockout position; stepper motion inhibited."
-}
-```
-- `level`: `"INFO"`, `"WARN"`, or `"ERR"`.
-
-#### F. Remote Data File Management (`type: "remote_data_list"` / `"remote_data_content"`)
-Sent in response to client `remote_data_req` operations:
-```json
-{
-  "type": "remote_data_list",
-  "files": [
-    {"name": "run_2026_11_04_hotfire.csv"},
-    "run_2026_11_04_coldflow.csv"
-  ]
-}
-```
-- Entries in `"files"` may be either strings (`"filename.csv"`) or objects with a `"name"` key (`{"name": "filename.csv", ...}`).
-
-When serving a file requested with `"operation": "get"`:
-```json
-{
-  "type": "remote_data_content",
-  "filename": "run_2026_11_04_hotfire.csv",
-  "mode": "load",
-  "content": "psi,psi,s\nP_RUN_TANK,P_INJECTOR,seconds\n740.1,539.2,0.0\n..."
-}
-```
-- `"mode"` must echo the client's requested mode (`"load"`, `"download"`, or `"pull_recording"`).
-  - When `"mode" == "pull_recording"` (triggered when a second user connects mid-recording and chooses to pull the current recorded state), the server should flush/read the currently active recording CSV (using `"filename"` if provided, or the active recording file if empty) and return its contents so far.
+#### C. Valve State (`type: "valve_state" | "summary"`), Armed (`type: "armed"`), Alert (`type: "alert"`)
+- `update_valve_state` / `update_valve_summary` normalizes firmware states (`CLOSE`→`CLOSED`, `TRANSIT`→`ACTUATING`, `FILLING`→`FILL`, `VENTING`→`VENT`, `CONNECT`→`CONNECTED`, `DISCONNECT`→`DISCONNECTED`, `FIRE`→`FIRED`) before broadcasting.
+- `set_armed(bool)` broadcasts `{"type": "armed", "armed": ...}`.
+- `send_alert(level, message)` broadcasts `{"type": "alert", "level": "INFO"|"WARN"|"ERR", "message": ...}` (including open-thermocouple warnings and interlock blocks).
 
 ---
 
-### 4.2 Client $\rightarrow$ Server Messages
+### 4.2 Client → Server Messages
 
-#### A. Valve / Actuator Actuation Command (`type: "command"`)
-Sent when the operator actuates a device while the client is **ARMED**:
-```json
-{
-  "type": "command",
-  "command": "CTRL",
-  "valve": "MEV",
-  "action": "OPEN"
-}
-```
-- `action`: Uppercased action string (`"OPEN"`, `"CLOSE"`, `"FILL"`, `"VENT"`, `"DISCONNECT"`, `"FIRE"`).
-- **Server Validation:** Even though the client enforces `armed == true`, `!external`, and `!expended(single_use)` interlocks, the server should independently validate actuator IDs, valid actions, and hardware safety interlocks before writing `MCC,CTRL,<VALVE>,<ACTION>\n` to serial.
+| `type` / `command` | Schema | Server Interlocks & Action |
+| :--- | :--- | :--- |
+| `command` / `CTRL` | `{"type": "command", "command": "CTRL", "valve": "N2OV", "action": "OPEN"}` | `_check_actuator_interlocks()` blocks actuation if `not self.armed`, `vdef["external"]`, or `vdef["single_use"]` is already `FIRED`/`DISCONNECTED`. Sends `WARN` alert to requester if blocked; otherwise delegates to `serial_controller.send_valve_command()`. |
+| `abort` / `ABORT` | `{"type": "abort", "command": "ABORT"}` | **Always permitted even when `armed == False`.** Dispatches `serial_controller.send_abort()`. |
+| `unabort` / `UNABORT` | `{"type": "unabort", "command": "UNABORT"}` | Dispatches `serial_controller.send_unabort()`. |
+| `summary` / `SUMMARY` | `{"type": "summary", "command": "SUMMARY"}` | Dispatches `serial_controller.request_summary()` or broadcasts `{"type": "summary", "valves": ...}`. |
+| `armed` / `arm` / `safe` | `{"type": "armed", "armed": true}` | Updates `self.set_armed(...)`. |
+| `record` / `RECORD` | `{"type": "record", "active": true|false, "filename": "..."}` | Opens/closes full-rate two-row CSV session in `data_dir`. Broadcasts `remote_data_list` on stop. |
+| `remote_data_req` | `{"type": "remote_data_req", "operation": "list"|"get"|"put"|"rename"|"delete", ...}` | Legacy WS fallback matching the HTTP `/api/data` operations below. |
 
-#### B. Emergency Abort (`type: "abort"`)
-Sent immediately when the operator triggers **Safety Override (CLOSE ALL VALVES)** or presses `[Space]`. **Always permitted even when the client is in SAFE mode.**
-```json
-{
-  "type": "abort",
-  "command": "ABORT"
-}
+**Recorded Two-Row CSV Header Format (`sensors.json`):**
+```csv
+kPa,kPa,kPa,kPa,kPa,kg,N,C,C,C,C,s
+P_INJECTOR,P_COMB_CHMBR,P_N2O_FLOW,P_N2_FLOW,P_RUN_TANK,M_RUN_TANK,L_THRUST,T_RUN_TANK,T_INJECTOR,T_COMB_CHMBR,T_POST_COMB,seconds
 ```
-- **Server Action:** Clear any pending command queue, immediately write `MCC,ABORT\n` to Arduino serial, broadcast an `"ERR"` `"alert"` to all connected clients, and broadcast updated `"valve_state"` frames as `VC,SUMMARY,...` arrives.
-
-#### C. Server Telemetry Recording Control (`type: "record"`)
-Sent when the operator toggles **Record telemetry** in the client top bar (or automatically re-sent on reconnect if local recording is active):
-- **Start Recording:**
-```json
-{
-  "type": "record",
-  "command": "RECORD",
-  "active": true,
-  "session_name": "telemetry_2026_11_14_100500.csv",
-  "filename": "telemetry_2026_11_14_100500.csv"
-}
-```
-- **Stop Recording:**
-```json
-{
-  "type": "record",
-  "command": "RECORD",
-  "active": false
-}
-```
-- **Server Action:** Open/close the CSV telemetry log in the server's `data/` directory using the provided sanitized `filename` (or `session_name`), and broadcast `"remote_data_list"` when a new recording finishes so clients see the saved file.
-
-#### D. Remote Data File Operations (`type: "remote_data_req"`)
-Sent by the client's Dashboard file manager:
-- **List files:**
-```json
-{
-  "type": "remote_data_req",
-  "operation": "list"
-}
-```
-  - Server replies with `remote_data_list`.
-- **Get file (Load or Download):**
-```json
-{
-  "type": "remote_data_req",
-  "operation": "get",
-  "filename": "run_2026_11_04_hotfire.csv",
-  "mode": "load"
-}
-```
-  - `"mode"` is `"load"` or `"download"`. Server replies with `remote_data_content` (or `"alert"` with `level: "ERR"` if missing).
-- **Rename file:**
-```json
-{
-  "type": "remote_data_req",
-  "operation": "rename",
-  "old_name": "a.csv",
-  "new_name": "b.csv"
-}
-```
-  - Server renames the file safely within `data/` and replies/broadcasts updated `remote_data_list`.
-- **Delete file (Deferred Commit — see Section 5):**
-```json
-{
-  "type": "remote_data_req",
-  "operation": "delete",
-  "filename": "a.csv"
-}
-```
-  - Server unlinks the file safely within `data/` and replies/broadcasts updated `remote_data_list`.
-
-> **Security Requirement:** The server must sanitize all `filename`, `old_name`, `new_name`, and `session_name` values (e.g., `Path(name).name`, rejecting `..` or path separators) so file operations cannot escape the server's `data/` directory.
-
-#### E. Optional / Reserved Server Commands (`summary`, `unabort`)
-Supported by the server serial bridge if triggered by future UI controls or diagnostic tools:
-- **Request State Summary:** `{"type": "summary", "command": "SUMMARY"}` $\rightarrow$ writes `MCC,SUMMARY\n`.
-- **Clear Abort State:** `{"type": "unabort", "command": "UNABORT"}` $\rightarrow$ writes `MCC,UNABORT\n`.
 
 ---
 
-## 5. Deferred File Deletion Protocol
+## 5. HTTP `/api/data` Endpoints (`ws_server.py` ↔ `DataRecorder`)
 
-To prevent accidental loss of irreplaceable test-fire telemetry logs, `Flow-Control-System-Client` implements a **soft-delete / deferred commit pattern** (`pendingDeleteMap` in `DashboardFunctions.qml`):
+All filenames pass through `sanitize_filename()` (rejecting `/`, `\`, `..`, empty names) and `DataRecorder` enforces `.csv` / `.jsonl` extensions so reads/writes cannot escape `data_dir`.
 
-1. **Mark for Deletion (Client-Local Only):**
-   - When the operator confirms deletion of a remote (or local) file in the Dashboard, the client does **not** send `operation: "delete"` immediately.
-   - Instead, it records `"remote:<filename>"` in `pendingDeleteMap` and displays the row struck-through with an **Undo** button (`undoDeletion(filename)`).
-2. **Undo Window:**
-   - While the Dashboard remains open and connected, the operator can click **Undo** to remove `"remote:<filename>"` from `pendingDeleteMap` with zero server/disk side effects.
-3. **Deferred Commit Trigger (`commitPendingDeletions()`):**
-   - Deletions are committed only when `Dashboard.qml` is destroyed (`Component.onDestruction` — e.g., navigating away from the Dashboard or closing the application) or when `onDisconnected` / `onWebsocket_closed` fires.
-   - At commit time, the client iterates over `pendingDeleteMap` and emits one `{"type": "remote_data_req", "operation": "delete", "filename": "<filename>"}` message per pending remote file (provided `ws_connected == true` when `Component.onDestruction` runs).
-4. **Server Implementation Requirements:**
-   - **No Server-Side Staging Required:** The server does not need to maintain a pending-delete queue or soft-delete state; it treats each incoming `operation: "delete"` as an immediate, final unlink in `data/`.
-   - **Handle Bursts Before Disconnect:** Because `commitPendingDeletions()` sends all queued `delete` frames back-to-back right as the Dashboard closes (or right before client shutdown), the server's WebSocket receive loop must process all queued `delete` messages sequentially without dropping frames if the client closes shortly afterward.
-   - **Idempotency & Error Handling:** If a file was already deleted by another client (or does not exist), the server should handle it gracefully (log/ignore or send a non-fatal `"WARN"`/`"ERR"` `"alert"`) without crashing the WebSocket handler.
-   - **Broadcast Updated List:** After deleting one or more files, send an updated `remote_data_list` so any remaining connected clients reflect the removal.
-
----
-
-## 6. Protocol Summary Table
-
-| Direction | `type` (or `identifier`) | Required Payload Keys | Purpose / Server Action |
-| :--- | :--- | :--- | :--- |
-| Server $\rightarrow$ Client | `init`, `actuators`, `config` | `armed` (opt), `actuators`/`valve_definitions` (opt), `valves` (opt) | Initial handshake & dynamic actuator/valve sync |
-| Server $\rightarrow$ Client | `telemetry` (or raw JSON/JSONL) | `data` dict or flat channel keys + time key | Live telemetry broadcast (`PSI`, `°C`, `lbf`) |
-| Server $\rightarrow$ Client | `valve_state`, `summary` | `valve` + `state` and/or `valves` dict | Single or bulk actuator state updates |
-| Server $\rightarrow$ Client | `armed` | `armed` (bool) | Synchronizes SAFE / ARMED interlock state |
-| Server $\rightarrow$ Client | `alert` | `level` (`INFO`/`WARN`/`ERR`), `message` | Sends toast & notification tray entry to client |
-| Server $\rightarrow$ Client | `remote_data_list` | `files` (list of strings or `{"name": ...}`) | Sends available remote log filenames |
-| Server $\rightarrow$ Client | `remote_data_content` | `filename`, `mode` (`load`/`download`), `content` | Delivers CSV file contents to client |
-| Server $\rightarrow$ Client | `STARTUP`, `FEEDBACK` *(legacy)* | `data` | Legacy `PDP-Monitoring-System` compatibility |
-| Client $\rightarrow$ Server | `command` | `command: "CTRL"`, `valve`, `action` | Actuate valve/device via `MCC,CTRL,...` |
-| Client $\rightarrow$ Server | `abort` | `command: "ABORT"` | Emergency abort via `MCC,ABORT` (always allowed) |
-| Client $\rightarrow$ Server | `record` | `command: "RECORD"`, `active`, `filename`/`session_name` (when active) | Start/stop synchronized server CSV recording |
-| Client $\rightarrow$ Server | `remote_data_req` | `operation` (`list`/`get`/`rename`/`delete`), `filename`/`old_name`/`new_name`, `mode` | Manage & serve telemetry logs (including deferred deletes) |
+| Method & Path | Request / Query | Response / Side Effect |
+| :--- | :--- | :--- |
+| `GET /api/data` | — | `{"files": [{"name": ..., "size": ..., "mtime": ...}, ...], "recording": bool, "recording_filename": str \| null}` |
+| `GET /api/data/{filename}` | — | Streams `FileResponse(..., media_type="text/csv")` (`400` invalid name, `404` missing; flushes active recording if downloading active log) |
+| `PUT /api/data/{filename}` | Raw CSV/JSONL body stream | Saves sanitized file into `data_dir`, broadcasts updated WS `remote_data_list`, returns `{"status": "ok", "filename": ..., "overwrote": bool, "bytes": int}` (`409` if writing to active recording) |
+| `POST /api/data/{filename}/rename` | JSON `{"new_name": "..."}` | Renames file inside `data_dir`, broadcasts WS `remote_data_list`, returns `{"status": "ok", "old_name": ..., "new_name": ...}` (`404`/`409`) |
+| `DELETE /api/data/{filename}` | — | Unlinks file from `data_dir` (used by client deferred deletion commits), broadcasts WS `remote_data_list`, returns `{"status": "ok", "filename": ...}` (`404`/`409`) |
