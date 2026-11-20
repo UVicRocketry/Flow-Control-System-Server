@@ -57,6 +57,7 @@ from data_recorder import (
     sanitize_filename,
     sanitize_telemetry_for_json,
 )
+from logging_config import resolve_uvicorn_log_level
 from sensors_config import (
     DEFAULT_SENSORS_CONFIG,
     SensorsConfig,
@@ -951,7 +952,8 @@ class FlowControlWSServer:
             self.create_app(),
             host=self.host,
             port=self.port,
-            log_level="info",
+            log_config=None,
+            log_level=resolve_uvicorn_log_level(),
             ws_max_size=16 * 1024 * 1024,
         )
         uv_server = uvicorn.Server(config)
@@ -976,20 +978,29 @@ class FlowControlWSServer:
                 asyncio.create_task(self._interactive_stdin_loop())
             )
 
-        logger.info(
-            "Starting FlowControlWSServer on http://%s:%d (/ws, /api/data) "
-            "(armed=%s, actuators=%d, sensors=%d)",
-            self.host,
-            self.port,
-            self.armed,
-            len(self.actuators),
-            len(self.sensors_config.sensors),
-        )
-
         try:
             if HAS_FASTAPI and uvicorn is not None:
+                logger.info(
+                    "Starting FlowControlWSServer on http://%s:%d (/ws, /api/data) "
+                    "(armed=%s, actuators=%d, sensors=%d)",
+                    self.host,
+                    self.port,
+                    self.armed,
+                    len(self.actuators),
+                    len(self.sensors_config.sensors),
+                )
                 await self._serve_uvicorn()
             elif _ws_serve is not None:
+                logger.warning(
+                    "FastAPI/Uvicorn unavailable; falling back to WebSocket-only "
+                    "mode on ws://%s:%d/ws (HTTP /api/data disabled; "
+                    "armed=%s, actuators=%d, sensors=%d)",
+                    self.host,
+                    self.port,
+                    self.armed,
+                    len(self.actuators),
+                    len(self.sensors_config.sensors),
+                )
                 async with _ws_serve(
                     self._ws_client_handler,
                     self.host,
@@ -1022,4 +1033,6 @@ class FlowControlWSServer:
             except Exception:
                 pass
         self.clients.clear()
-        logger.info("FlowControlWSServer shut down cleanly.")
+        logger.info(
+            "FlowControlWSServer shut down cleanly. Press enter to return to console."
+        )

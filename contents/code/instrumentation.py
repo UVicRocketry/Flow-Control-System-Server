@@ -20,6 +20,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from logging_config import configure_logging
 from sensors_config import (
     GAIN_BITMASKS,
     MODE_BITMASKS,
@@ -541,10 +542,7 @@ class LabJackInstrumentation:
 if __name__ == "__main__":
     import json
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    configure_logging(logging.INFO)
     if u6 is None:
         raise SystemExit(
             "Error: LabJackPython ('u6') is not installed in this environment."
