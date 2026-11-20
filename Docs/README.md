@@ -2,25 +2,26 @@
 
 Welcome to the technical documentation for the **Flow Control System Server** (`flow-control-server`), the Python backend service running on the **Valve Cart Mini PC** (`uvr@192.168.0.1`).
 
-Currently, [`contents/code/main.py`](../contents/code/main.py) is a stub (`print("hello world")`), while the deployment tooling ([`tools/push-code.sh`](../tools/push-code.sh), [`tools/services.sh`](../tools/services.sh)) and `systemd` service unit ([`contents/config/flow-control-server.service`](../contents/config/flow-control-server.service)) are fully operational. This documentation specifies the server architecture, communication protocols, design rationale, and implementation roadmap drawing from the reference [`PDP-Monitoring-System`](../../PDP-Monitoring-System/) and [`PDP-Ground-Support-Rewrite`](../../PDP-Ground-Support-Rewrite/) codebases.
+The server is implemented across [`contents/code/`](../contents/code/) using **FastAPI + Uvicorn** (`WS /ws` + streaming `HTTP /api/data`), Pydantic-validated sensor configuration (`sensors.json`), full-rate LabJack U6 USB instrumentation (`instrumentation.py` + `thermocouple.py`), two-row CSV session recording (`data_recorder.py`), unified console logging (`logging_config.py`), and automatic mock simulation (`mocks.py`) when hardware is absent. Controls Arduino serial integration (`serial_controller.py`) is specified in [`actuation-spec.md`](./actuation-spec.md) for drop-in hardware integration.
 
 ---
 
 ## Contents
 
-1. **[Communication Protocol & Architecture (`protocol-and-architecture.md`)](./protocol-and-architecture.md)**
-   - End-to-end communication topology: **Mission Control Client ↔ Valve Cart Server ↔ Controls Arduino & LabJack U6**.
-   - **WebSocket Protocol (`ws://192.168.0.1:8080/ws`)**: JSON/JSONL packet schemas for live telemetry broadcast, valve actuation commands, limit-switch state updates, emergency abort, on-cart recording, and remote log file management.
-   - **USB Serial Protocol (`/dev/ttyACM0 @ 115200`)**: CSV command/response specification (`MCC`/`VC`, `CTRL`, `ABORT`, `UNABORT`, `CONNECT`, `SUMMARY`, `STATUS`, `ERROR`) interfacing with `Controls.ino`.
-   - **LabJack U6 Instrumentation Pipeline**: Channel mappings (`AIN49`–`AIN87`), differential vs. single-ended gains, cold-junction thermocouple compensation (`thermocouple.py`), and unit conversions.
-   - **Architectural Reasoning**: Why specific design flaws in the legacy `PDP-Monitoring-System` (`LifoQueue`, `tmp.txt` IPC file polling, dual WebSocket ports `8080`/`8888`, early return in `SUMMARY` parsing) are replaced with a unified `asyncio` architecture.
+1. **[Architecture, LabJack U6 & Serial Overview (`protocol-and-architecture.md`)](./protocol-and-architecture.md)**
+   - End-to-end communication topology: **Mission Control Client ↔ FastAPI/Uvicorn Server ↔ Controls Arduino & LabJack U6**.
+   - Architectural rationale replacing legacy `PDP-Monitoring-System` bottlenecks (unified port `8080`, in-memory `asyncio.Queue` FIFO vs. `tmp.txt`/`LifoQueue`, `VC,SUMMARY` full-packet parsing, pure Python runtime).
+   - Validated [`contents/config/sensors.json`](../contents/config/sensors.json) schema, LabJack U6 channel calibration (`kPa`, `M_RUN_TANK` in `kg`, `L_THRUST` in `N`, `°C`), and open-thermocouple `NaN` fault alerting.
 
-2. **[Server Implementation Roadmap (`roadmap.md`)](./roadmap.md)**
-   - Phased engineering plan to build out `Flow-Control-System-Server/contents/code/` from the reference modules in `PDP-Monitoring-System` and `PDP-Ground-Support-Rewrite`.
-   - Module breakdown, unit conversion formulas, simulation/mock mode (`--mock`), on-cart telemetry logging, remote file transfer handlers, and hardware-in-the-loop verification.
+2. **[WebSocket & HTTP `/api/data` Protocol Specification (`websocket-protocol.md`)](./websocket-protocol.md)**
+   - Complete **`WS /ws`** JSON/JSONL contract (`init` with `channels` metadata, `telemetry`, `valve_state`/`summary`, `armed`, `alert`, `command`, `abort`, `unabort`, `record`) plus server-side safety interlocks.
+   - Streaming **`HTTP /api/data/...`** endpoints (`GET /api/data`, `GET /api/data/{filename}`, `PUT /api/data/{filename}`, `POST /api/data/{filename}/rename`, `DELETE /api/data/{filename}`) and legacy WebSocket `remote_data_req` fallback + Deferred File Deletion semantics.
 
-3. **[WebSocket Protocol Specification (`websocket-protocol.md`)](./websocket-protocol.md)**
-   - Complete Server $\leftrightarrow$ Client JSON/JSONL wire contract (`init`/`actuators`/`config`, `telemetry`, `valve_state`/`summary`, `armed`, `alert`, `command`, `abort`, `record`, `remote_data_req`/`remote_data_list`/`remote_data_content`), state normalization, and the **Deferred File Deletion Protocol**.
+3. **[Actuator Controls & Arduino Serial Specification (`actuation-spec.md`)](./actuation-spec.md)**
+   - Interface contract for `contents/code/serial_controller.py` on `server.serial_controller` (`/dev/ttyACM0 @ 115200` baud), `Controls.ino` CSV protocol, USB hotplug resilience, and legacy firmware bug workarounds.
+
+4. **[Implementation Roadmap (`roadmap.md`)](./roadmap.md) & [Maintainability Roadmap (`maintainability-roadmap.md`)](./maintainability-roadmap.md)**
+   - Phase status across server modules, ops scripts, CI verification, and upcoming `serial_controller.py` hardware integration.
 
 ---
 
@@ -29,34 +30,30 @@ Currently, [`contents/code/main.py`](../contents/code/main.py) is a stub (`print
 ```mermaid
 flowchart LR
     subgraph MCC["Mission Control Station"]
-        CLIENT["Flow-Control-System-Client\n(PySide6 / Kirigami UI)"]
-        AP["TP-Link CPE-710 (AP)\n192.168.0.254\nSSID: UVR-PDP"]
+        CLIENT["Flow-Control-System-Client<br/>(PySide6 / Kirigami + QNetworkAccessManager)"]
+        AP["TP-Link CPE-710 (AP)<br/>192.168.0.254<br/>SSID: UVR-PDP"]
         CLIENT --- AP
     end
 
     subgraph VC["Valve Cart"]
-        CPE_C["TP-Link CPE-710 (Client)\n192.168.0.253"]
-        MINIPC["Valve Cart Mini PC\nUbuntu Linux (uvr@192.168.0.1)\nflow-control-server.service"]
-        ARDUINO["Controls Arduino Mega\n/dev/ttyACM0 @ 115200 baud\n(Controls.ino / Valve.cpp)"]
-        LABJACK["LabJack U6 Pro DAQ\nUSB Streaming Mode\n(11 Sensor Channels)"]
+        CPE_C["TP-Link CPE-710 (Client)<br/>192.168.0.253"]
+        MINIPC["Valve Cart Mini PC<br/>Ubuntu Linux (uvr@192.168.0.1)<br/>FastAPI + Uvicorn :8080<br/>(flow-control-server.service)"]
+        ARDUINO["Controls Arduino Mega<br/>/dev/ttyACM0 @ 115200 baud<br/>(Controls.ino / Valve.cpp)"]
+        LABJACK["LabJack U6 Pro DAQ<br/>1000 Hz Scan / ~83.3 Hz USB Stream<br/>(11 Sensor Channels)"]
 
         CPE_C --- MINIPC
         MINIPC <== "USB Serial CSV" ==> ARDUINO
         LABJACK == "USB Bulk Stream" ==> MINIPC
     end
 
-    AP <== "5 GHz Point-to-Point Wi-Fi\nws://192.168.0.1:8080/ws" ==> CPE_C
+    AP <== "WS /ws + HTTP /api/data (:8080)<br/>5 GHz Wi-Fi or Direct Ethernet" ==> CPE_C
 ```
 
 ---
 
-## Deployment & Operations Tooling (Already Implemented)
+## Deployment & Operations Tooling (`tools/`)
 
-The server repository includes automated deployment and service management scripts in [`tools/`](../tools/):
-
-- **[`tools/push-code.sh`](../tools/push-code.sh)**:
-  - Uses `SSH_ASKPASS` / `sshpass` with `ControlMaster` multiplexing and `rsync -avz --delete` to push code incrementally to `uvr@192.168.0.1:/home/uvr/Flow-Control-System-Server`.
-  - Automatically installs [`contents/config/flow-control-server.service`](../contents/config/flow-control-server.service) to `/etc/systemd/system/`, reloads `systemd`, enables autostart on boot, and restarts the service.
-  - **Why this design:** Eliminates manual SCP/SSH steps on the test pad and guarantees the Valve Cart Mini PC automatically restarts the server (`Restart=always`, `RestartSec=3`) if a power dip or process crash occurs.
-- **[`tools/services.sh`](../tools/services.sh)**:
-  - Provides both CLI subcommands (`status`, `restart`, `start`, `stop`, `logs -f`, `enable`, `disable`) and an interactive menu for managing `flow-control-server.service` and tailing `journald` logs remotely.
+- **[`tools/_common.sh`](../tools/_common.sh):** Shared SSH (`SSH_ASKPASS` / `sshpass` / `ControlMaster`), `password.txt`, and remote `sudo -S` plumbing.
+- **[`tools/push-code.sh`](../tools/push-code.sh):** Incremental `rsync -avz --delete` protecting remote `data/` and `.venv/`, offline-safe `.venv` dependency installation (wheelhouse or PyPI with short timeout), installs [`contents/config/flow-control-server.service`](../contents/config/flow-control-server.service), and restarts `systemd`.
+- **[`tools/services.sh`](../tools/services.sh):** Manage `systemd` (`status`, `restart`, `start`, `stop`, `logs [-f]`, `enable`, `disable`) and download/push offline Python wheels + LabJack `exodriver` (`fetch-deps`, `push-deps`).
+- **[`tools/direct-ethernet.sh`](../tools/direct-ethernet.sh):** Configures PC-to-cart direct Ethernet links (`initiate`, `restore`, `status`, `install-server`, `server-detect`) alongside [`contents/code/direct-eth-detect.sh`](../contents/code/direct-eth-detect.sh).
