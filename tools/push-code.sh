@@ -53,7 +53,7 @@ fi
 if [[ "${SKIP_DEPS_CHECK:-0}" == "1" ]]; then
     echo "==> Skipping remote dependency check (SKIP_DEPS_CHECK=1)."
 elif ! run_ssh "test -x '${REMOTE_VENV}/bin/python' && '${REMOTE_VENV}/bin/python' -c 'import fastapi, uvicorn, pydantic, websockets, serial, u6' >/dev/null 2>&1"; then
-    run_ssh "if [[ ! -x '${REMOTE_VENV}/bin/python' ]]; then python3 -m venv --system-site-packages '${REMOTE_VENV}'; fi"
+    run_ssh "if [[ ! -x '${REMOTE_VENV}/bin/python' ]] || [[ ! -f '${REMOTE_VENV}/bin/activate' ]] || grep -q 'include-system-site-packages = false' '${REMOTE_VENV}/pyvenv.cfg' 2>/dev/null; then rm -rf '${REMOTE_VENV}'; python3 -m venv --without-pip --system-site-packages '${REMOTE_VENV}' || python3 -m venv --system-site-packages '${REMOTE_VENV}'; fi"
     if [[ "${HAS_LOCAL_WHEELS}" == "1" ]]; then
         REMOTE_WHEEL_TMP="/tmp/fcs-push-wheels"
         echo "--> Installing dependencies into '${REMOTE_VENV}' from cached local wheelhouse ..."
@@ -63,6 +63,10 @@ elif ! run_ssh "test -x '${REMOTE_VENV}/bin/python' && '${REMOTE_VENV}/bin/pytho
 set -euo pipefail
 trap 'rm -rf "${REMOTE_WHEEL_TMP}"' EXIT
 echo "--> Target Python: \$("${REMOTE_VENV}/bin/python" --version) (\$(uname -m))"
+PIP_WHL="\$(ls -1 "${REMOTE_WHEEL_TMP}"/pip-*.whl 2>/dev/null | sort -V | tail -n 1 || true)"
+if [[ -n "\${PIP_WHL}" ]]; then
+    PYTHONPATH="\${PIP_WHL}" "${REMOTE_VENV}/bin/python" -m pip install --no-index --find-links "${REMOTE_WHEEL_TMP}" --upgrade pip
+fi
 "${REMOTE_VENV}/bin/python" -m pip install --no-index --find-links "${REMOTE_WHEEL_TMP}" -r "${REMOTE_DIR}/requirements.txt"
 EOF
         then

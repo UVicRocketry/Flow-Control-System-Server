@@ -128,6 +128,15 @@ do_fetch_deps() {
     labjack_reqs="$(mktemp)"
 
     grep -Ev '^[[:space:]]*(#|$)' "${REQUIREMENTS_FILE}" | grep -viE '^[[:space:]]*labjackpython' > "${binary_reqs}" || true
+    # Include bootstrap & Python 3.10 marker packages (pip download on Python >=3.11
+    # evaluates python_version<"3.11" markers against the host interpreter).
+    cat >> "${binary_reqs}" <<EOF
+pip>=24.2
+setuptools>=68.0
+wheel>=0.42
+exceptiongroup>=1.0.2
+typing_extensions>=4.10.0
+EOF
     grep -iE '^[[:space:]]*labjackpython' "${REQUIREMENTS_FILE}" > "${labjack_reqs}" || true
 
     local plat_args=(
@@ -219,8 +228,10 @@ sudo_cmd() {
 
 VENV_PY="python3"
 mkdir -p "${REMOTE_DIR}"
-if [[ ! -x "${REMOTE_VENV}/bin/python" ]]; then
-    python3 -m venv --system-site-packages "${REMOTE_VENV}" || true
+if [[ ! -x "${REMOTE_VENV}/bin/python" ]] || [[ ! -f "${REMOTE_VENV}/bin/activate" ]] || grep -q "include-system-site-packages = false" "${REMOTE_VENV}/pyvenv.cfg" 2>/dev/null; then
+    rm -rf "${REMOTE_VENV}"
+    python3 -m venv --without-pip --system-site-packages "${REMOTE_VENV}" || \
+        python3 -m venv --system-site-packages "${REMOTE_VENV}" || true
 fi
 if [[ -x "${REMOTE_VENV}/bin/python" ]]; then
     VENV_PY="${REMOTE_VENV}/bin/python"
@@ -229,6 +240,10 @@ fi
 echo "--> Target Python: \$("\${VENV_PY}" --version) (\$(uname -m))"
 echo "--> Installing Python packages into '${REMOTE_VENV}' (offline wheelhouse) ..."
 if [[ "\${VENV_PY}" != "python3" ]]; then
+    PIP_WHL="\$(ls -1 "${remote_tmp}/wheels"/pip-*.whl 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "\${PIP_WHL}" ]]; then
+        PYTHONPATH="\${PIP_WHL}" "\${VENV_PY}" -m pip install --no-index --find-links "${remote_tmp}/wheels" --upgrade pip
+    fi
     "\${VENV_PY}" -m pip install --no-index --find-links "${remote_tmp}/wheels" -r "${remote_tmp}/requirements.txt"
 else
     PIP_EXTRA_ARGS=()
