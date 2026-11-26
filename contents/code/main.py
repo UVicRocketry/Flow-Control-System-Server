@@ -19,6 +19,7 @@ import signal
 from pathlib import Path
 
 from instrumentation import LabJackInstrumentation, detect_labjack_present
+from logging_config import configure_logging
 from mocks import MockHardwareSimulator
 from sensors_config import DEFAULT_SENSORS_CONFIG
 from ws_server import (
@@ -242,11 +243,7 @@ async def async_main(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    configure_logging(args.log_level)
     try:
         asyncio.run(async_main(args))
     except KeyboardInterrupt:

@@ -38,6 +38,7 @@ max-complexity = 15
 known-first-party = [
     "data_recorder",
     "instrumentation",
+    "logging_config",
     "mocks",
     "sensors_config",
     "serial_controller",

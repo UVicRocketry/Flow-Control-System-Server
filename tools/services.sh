@@ -24,10 +24,14 @@ Commands:
   logs [-f]         Show recent journald logs (pass -f to follow live)
   enable            Enable the service to autostart at boot
   disable           Disable the service from autostarting at boot
-  fetch-deps        Download Python wheels & LabJack exodriver into tools/vendor/
+  fetch-deps        Download Ubuntu Linux wheels & LabJack exodriver into tools/vendor/
   push-deps         Push cached dependencies over SSH & install offline on valve cart
   direct-eth [args] Open or forward commands to tools/direct-ethernet.sh
   help              Show this help message
+
+Environment (for fetch-deps):
+  TARGET_ARCH         Target wheel CPU architecture (default: x86_64)
+  TARGET_PY_VERSIONS  Space-separated Python minor versions (default: "3.10 3.11 3.12")
 EOF
 }
 
@@ -84,6 +88,8 @@ VENDOR_DIR="${SCRIPT_DIR}/vendor"
 VENDOR_WHEELS_DIR="${VENDOR_DIR}/wheels"
 VENDOR_EXODRIVER_DIR="${VENDOR_DIR}/exodriver"
 REQUIREMENTS_FILE="${REPO_ROOT}/requirements.txt"
+TARGET_ARCH="${TARGET_ARCH:-x86_64}"
+TARGET_PY_VERSIONS="${TARGET_PY_VERSIONS:-3.10 3.11 3.12}"
 
 do_fetch_deps() {
     echo "==> Preparing local offline dependency bundle in '${VENDOR_DIR}' ..."
@@ -94,15 +100,83 @@ do_fetch_deps() {
         return 1
     fi
 
-    echo "==> Downloading Python packages from '${REQUIREMENTS_FILE}' ..."
-    # Download universal wheels / source distributions so they work across Python versions on the cart
-    python3 -m pip download \
-        --dest "${VENDOR_WHEELS_DIR}" \
-        -r "${REQUIREMENTS_FILE}"
-    python3 -m pip download \
-        --no-binary :all: \
-        --dest "${VENDOR_WHEELS_DIR}" \
-        -r "${REQUIREMENTS_FILE}" || true
+    local arch="${TARGET_ARCH}"
+    local py_versions="${TARGET_PY_VERSIONS}"
+
+    if [[ -f "${PASSWORD_FILE}" ]] && is_valve_cart_reachable; then
+        local detected_arch=""
+        local detected_py=""
+        detected_arch="$(run_ssh "uname -m" 2>/dev/null || true)"
+        detected_py="$(run_ssh "python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")'" 2>/dev/null || true)"
+        if [[ -n "${detected_arch}" ]]; then
+            arch="${detected_arch}"
+        fi
+        if [[ -n "${detected_py}" ]]; then
+            case " ${py_versions} " in
+                *" ${detected_py} "*) ;;
+                *) py_versions="${py_versions} ${detected_py}" ;;
+            esac
+        fi
+        if [[ -n "${detected_arch}" || -n "${detected_py}" ]]; then
+            echo "==> Detected valve cart target: arch=${arch}, python=${detected_py:-unknown}"
+        fi
+    fi
+
+    local binary_reqs
+    local labjack_reqs
+    binary_reqs="$(mktemp)"
+    labjack_reqs="$(mktemp)"
+
+    grep -Ev '^[[:space:]]*(#|$)' "${REQUIREMENTS_FILE}" | grep -viE '^[[:space:]]*labjackpython' > "${binary_reqs}" || true
+    # Include bootstrap & Python 3.10 marker packages (pip download on Python >=3.11
+    # evaluates python_version<"3.11" markers against the host interpreter).
+    cat >> "${binary_reqs}" <<EOF
+pip>=24.2
+setuptools>=68.0
+wheel>=0.42
+exceptiongroup>=1.0.2
+typing_extensions>=4.10.0
+EOF
+    grep -iE '^[[:space:]]*labjackpython' "${REQUIREMENTS_FILE}" > "${labjack_reqs}" || true
+
+    local plat_args=(
+        --platform "manylinux_2_35_${arch}"
+        --platform "manylinux_2_31_${arch}"
+        --platform "manylinux_2_28_${arch}"
+        --platform "manylinux_2_17_${arch}"
+        --platform "manylinux2014_${arch}"
+        --platform "linux_${arch}"
+    )
+
+    if [[ -s "${binary_reqs}" ]]; then
+        local pyver
+        for pyver in ${py_versions}; do
+            echo "==> Downloading Linux (${arch}) binary wheels for Python ${pyver} ..."
+            if ! python3 -m pip download \
+                --only-binary=:all: \
+                "${plat_args[@]}" \
+                --python-version "${pyver}" \
+                --implementation cp \
+                --dest "${VENDOR_WHEELS_DIR}" \
+                -r "${binary_reqs}"; then
+                rm -f "${binary_reqs}" "${labjack_reqs}"
+                return 1
+            fi
+        done
+    fi
+
+    if [[ -s "${labjack_reqs}" ]]; then
+        echo "==> Building universal wheel for pure-Python packages (LabJackPython) ..."
+        if ! python3 -m pip wheel --no-deps --wheel-dir "${VENDOR_WHEELS_DIR}" -r "${labjack_reqs}"; then
+            echo "Warning: Could not build universal wheel; downloading sdist fallback ..." >&2
+            if ! python3 -m pip download --no-deps --dest "${VENDOR_WHEELS_DIR}" -r "${labjack_reqs}"; then
+                rm -f "${binary_reqs}" "${labjack_reqs}"
+                return 1
+            fi
+        fi
+    fi
+
+    rm -f "${binary_reqs}" "${labjack_reqs}"
 
     if [[ ! -d "${VENDOR_EXODRIVER_DIR}/liblabjackusb" ]]; then
         if command -v git >/dev/null 2>&1; then
@@ -146,6 +220,7 @@ do_push_deps() {
     escaped_pw="$(printf '%q' "${SSH_PASSWORD}")"
     run_ssh "bash -s" <<EOF
 set -euo pipefail
+trap 'rm -rf "${remote_tmp}"' EXIT
 
 sudo_cmd() {
     printf '%s\n' ${escaped_pw} | sudo -S -p '' "\$@"
@@ -153,16 +228,23 @@ sudo_cmd() {
 
 VENV_PY="python3"
 mkdir -p "${REMOTE_DIR}"
-if [[ ! -x "${REMOTE_VENV}/bin/python" ]]; then
-    python3 -m venv --system-site-packages "${REMOTE_VENV}" || true
+if [[ ! -x "${REMOTE_VENV}/bin/python" ]] || [[ ! -f "${REMOTE_VENV}/bin/activate" ]] || grep -q "include-system-site-packages = false" "${REMOTE_VENV}/pyvenv.cfg" 2>/dev/null; then
+    rm -rf "${REMOTE_VENV}"
+    python3 -m venv --without-pip --system-site-packages "${REMOTE_VENV}" || \
+        python3 -m venv --system-site-packages "${REMOTE_VENV}" || true
 fi
 if [[ -x "${REMOTE_VENV}/bin/python" ]]; then
     VENV_PY="${REMOTE_VENV}/bin/python"
 fi
 
+echo "--> Target Python: \$("\${VENV_PY}" --version) (\$(uname -m))"
 echo "--> Installing Python packages into '${REMOTE_VENV}' (offline wheelhouse) ..."
-if [[ "${VENV_PY}" != "python3" ]]; then
-    "${VENV_PY}" -m pip install --no-index --find-links "${remote_tmp}/wheels" -r "${remote_tmp}/requirements.txt"
+if [[ "\${VENV_PY}" != "python3" ]]; then
+    PIP_WHL="\$(ls -1 "${remote_tmp}/wheels"/pip-*.whl 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -n "\${PIP_WHL}" ]]; then
+        PYTHONPATH="\${PIP_WHL}" "\${VENV_PY}" -m pip install --no-index --find-links "${remote_tmp}/wheels" --upgrade pip
+    fi
+    "\${VENV_PY}" -m pip install --no-index --find-links "${remote_tmp}/wheels" -r "${remote_tmp}/requirements.txt"
 else
     PIP_EXTRA_ARGS=()
     if python3 -m pip install --help 2>&1 | grep -q -- '--break-system-packages'; then
@@ -204,9 +286,7 @@ sudo_cmd usermod -aG dialout "${REMOTE_USER}" 2>/dev/null || true
 sudo_cmd usermod -aG adm "${REMOTE_USER}" 2>/dev/null || true
 
 echo "--> Verifying installed Python modules on ${REMOTE_TARGET} ..."
-"${VENV_PY}" -c "import fastapi, uvicorn, pydantic, websockets, serial, u6; print('SUCCESS: fastapi, uvicorn, pydantic, websockets, pyserial, and LabJackPython (u6) imported cleanly!')"
-
-rm -rf "${remote_tmp}"
+"\${VENV_PY}" -c "import fastapi, uvicorn, pydantic, websockets, serial, u6; print('SUCCESS: fastapi, uvicorn, pydantic, websockets, pyserial, and LabJackPython (u6) imported cleanly!')"
 EOF
 
     echo "==> Offline dependency installation complete! Restarting '${SERVICE_NAME}' ..."

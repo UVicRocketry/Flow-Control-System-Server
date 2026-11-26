@@ -18,8 +18,11 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
+from logging_config import configure_logging
 from sensors_config import (
     GAIN_BITMASKS,
     MODE_BITMASKS,
@@ -430,17 +433,16 @@ class LabJackInstrumentation:
     # ------------------------------------------------------------------
     # Dedicated LabJack U6 USB Stream Thread
     # ------------------------------------------------------------------
-    def _open_and_configure_device(self) -> tuple[Any, float]:
-        d = u6.U6()
+    def _configure_device(self, device: Any) -> float:
         # Ensure any previous leftover stream is stopped before configuring
         try:
-            d.streamStop()
+            device.streamStop()
         except Exception:
             pass
 
         stream_cfg = self.sensors_config.stream
         settings = self.sensors_config.channel_settings()
-        d.streamConfig(
+        device.streamConfig(
             ScanFrequency=stream_cfg.scan_frequency,
             ChannelNumbers=[x[0] for x in settings],
             ChannelOptions=[x[1] for x in settings],
@@ -450,7 +452,7 @@ class LabJackInstrumentation:
             SamplesPerPacket=stream_cfg.samples_per_packet,
         )
 
-        t_ref_k = d.getTemperature()
+        t_ref_k = device.getTemperature()
         v_ref = get_ref_voltage(t_ref_k)
         logger.info(
             "LabJack U6 configured (scan=%d Hz, channels=%d, spp=%d, "
@@ -462,7 +464,20 @@ class LabJackInstrumentation:
             t_ref_k - 273.15,
             v_ref,
         )
-        return d, v_ref
+        return v_ref
+
+    @contextmanager
+    def _open_stream(self) -> Iterator[tuple[Any, float]]:
+        """Open, configure, start, and reliably close a LabJack U6 stream."""
+        device = u6.U6()
+        stream_started = False
+        try:
+            v_ref = self._configure_device(device)
+            device.streamStart()
+            stream_started = True
+            yield device, v_ref
+        finally:
+            self._close_device(device, stream_started)
 
     def _stream_device_packets(self, device: Any, v_ref: float) -> None:
         for reading in device.streamData(convert=False):
@@ -510,18 +525,14 @@ class LabJackInstrumentation:
     def _stream_thread_main(self) -> None:
         had_failure = False
         while not self._stop_event.is_set():
-            device = None
-            stream_started = False
             try:
-                device, v_ref = self._open_and_configure_device()
-                device.streamStart()
-                stream_started = True
-                if had_failure:
-                    had_failure = False
-                    self._emit_alert_threadsafe(
-                        "INFO", "LabJack U6 telemetry stream reconnected."
-                    )
-                self._stream_device_packets(device, v_ref)
+                with self._open_stream() as (device, v_ref):
+                    if had_failure:
+                        had_failure = False
+                        self._emit_alert_threadsafe(
+                            "INFO", "LabJack U6 telemetry stream reconnected."
+                        )
+                    self._stream_device_packets(device, v_ref)
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
@@ -534,17 +545,12 @@ class LabJackInstrumentation:
                         f"retrying in {self.reconnect_delay:.1f}s...",
                     )
                 self._stop_event.wait(self.reconnect_delay)
-            finally:
-                self._close_device(device, stream_started)
 
 
 if __name__ == "__main__":
     import json
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    configure_logging(logging.INFO)
     if u6 is None:
         raise SystemExit(
             "Error: LabJackPython ('u6') is not installed in this environment."

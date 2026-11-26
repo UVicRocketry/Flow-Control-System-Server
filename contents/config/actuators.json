@@ -25,6 +25,18 @@
             "key": "2"
         },
         {
+            "id": "FILL",
+            "label": "Fill Valve (FILL)",
+            "type": "servo",
+            "normal_state": "CLOSED",
+            "states": [
+                "OPEN",
+                "CLOSED"
+            ],
+            "hint": "2 LS",
+            "key": "3"
+        },
+        {
             "id": "RTV",
             "label": "Run Tank 3-Way Solenoid (RTV)",
             "type": "solenoid_3way",
@@ -35,7 +47,7 @@
                 "VENT"
             ],
             "hint": "3 LS",
-            "key": "3"
+            "key": "4"
         },
         {
             "id": "QD",
@@ -49,7 +61,7 @@
             "hint": "No LS",
             "single_use": true,
             "requires_confirm": true,
-            "key": "4"
+            "key": "5"
         },
         {
             "id": "MEV",
@@ -64,7 +76,7 @@
             "single_use": true,
             "requires_confirm": true,
             "external": false,
-            "key": "5"
+            "key": "6"
         },
         {
             "id": "MRV",

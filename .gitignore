@@ -87,3 +87,7 @@ CMakeLists.txt.user*
 password.txt
 **/password.txt
 tools/vendor/
+
+# Local Python virtual environments (Linux & MSYS2 UCRT64)
+.venv/
+.venv-ucrt64/
