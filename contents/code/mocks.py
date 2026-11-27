@@ -30,7 +30,6 @@ logger = logging.getLogger("fcs.mocks")
 ABORT_VALVE_OVERRIDES: dict[str, str] = {
     "N2OV": "CLOSED",
     "N2OF": "CLOSED",
-    "N2F": "CLOSED",
     "NCV": "CLOSED",
     "DUMP": "OPEN",
     "ERV": "OPEN",

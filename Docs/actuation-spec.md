@@ -71,17 +71,17 @@ Pass `ws_server: FlowControlWSServer` into `SerialController.__init__(...)`. Whe
 | `MCC,CONNECT\n` | Prints `VC,STATUS,ESTABLISH` and calls `sendState()` (`VC,SUMMARY,...`). | Send immediately upon opening or reconnecting the serial port. |
 | `MCC,SUMMARY\n` | Calls `sendState()` (`VC,SUMMARY,...`). | Polls all current limit-switch states. |
 | `MCC,CTRL,<VALVE>,<ACTION>\n` | Calls `setTarget()` to set `TargetState[index]`. | **Send only ONE valve per line** (see firmware bug in Section 5.2). |
-| `MCC,ABORT\n` | Sets `ABORT = true`, prints `VC,STATUS,ABORTED`, cuts `Igniter` & `Solenoid` (`LOW`), closes `N2OF`, `N2F`, `MEV`, `RTV`, `NCV`, opens `N2OV` & `ERV`. | Overrides hardware `KeySwitch` lockout (`Controls.ino:190`). |
+| `MCC,ABORT\n` | Sets `ABORT = true`, prints `VC,STATUS,ABORTED`, cuts `Igniter` & `Solenoid` (`LOW`), closes `N2OF`, `MEV`, `RTV`, `NCV`, opens `N2OV` & `ERV`. | Overrides hardware `KeySwitch` lockout (`Controls.ino:190`). |
 | `MCC,UNABORT\n` | Clears `ABORT = false`, prints `VC,STATUS,CANCELLED ABORT`. | Only clears if `ABORT == true`. |
 
 #### Action Translation (`actuators.json` → `Controls.ino`)
 
-In [`contents/config/actuators.json`](../contents/config/actuators.json), actuators use UI-friendly actions (`OPEN`, `CLOSE`, `FILL`, `VENT`, `FIRE`, `DISCONNECT`), whereas `Controls.ino:268-278` only checks `Value == "OPEN"` (`-1`) and `Value == "CLOSE"` (`1`):
+In [`contents/config/actuators.json`](../contents/config/actuators.json), actuators use UI-friendly actions (`OPEN`, `CLOSE`, `FILL`, `VENT`, `FIRE`, `DISCONNECT`, `DUMP`), whereas `Controls.ino:268-278` only checks `Value == "OPEN"` (`-1`) and `Value == "CLOSE"` (`1`):
 
 - Map `OPEN` / `FILL` → `OPEN`
 - Map `CLOSE` / `VENT` → `CLOSE`
 - Supported firmware valve labels in `Controls.ino:239-266`:
-  - `N2OF`, `N2OV`, `N2F`, `ERV`, `MEV`, `RTV`, `IGPRIME`, `NCV`
+  - `N2OF`, `N2OV`, `ERV`, `MEV`, `RTV`, `IGPRIME`, `NCV`
 
 ---
 
@@ -93,12 +93,12 @@ Your serial reader loop must read `\n`-terminated lines from the Arduino, strip 
 Emitted by `Controls.ino:199-210` (`sendState()`) on `CONNECT`, `SUMMARY`, and **automatically whenever `Valve::getChange()` detects a limit-switch state transition** in `MoveToTarget()`:
 
 ```text
-VC,SUMMARY,N2OF,<s0>,N2OV,<s1>,N2F,<s2>,RTV,<s3>,ERV,<s4>,MEV,<s5>,NCV,<s6>
+VC,SUMMARY,N2OF,<s0>,N2OV,<s1>,RTV,<s2>,ERV,<s3>,MEV,<s4>,NCV,<s5>
 ```
 
 Example:
 ```text
-VC,SUMMARY,N2OF,CLOSE,N2OV,OPEN,N2F,CLOSE,RTV,VENTING,ERV,TRANSIT,MEV,CLOSE,NCV,CLOSE
+VC,SUMMARY,N2OF,CLOSE,N2OV,OPEN,RTV,VENTING,ERV,TRANSIT,MEV,CLOSE,NCV,CLOSE
 ```
 
 **How `Valve.cpp` determines each state:**
@@ -106,7 +106,6 @@ VC,SUMMARY,N2OF,CLOSE,N2OV,OPEN,N2F,CLOSE,RTV,VENTING,ERV,TRANSIT,MEV,CLOSE,NCV,
   - `OpenLimit == LOW` (active-low `INPUT_PULLUP`) → `"OPEN"`
   - `CloseLimit == LOW` → `"CLOSE"`
   - Neither limit switch active → `"TRANSIT"`
-- **`N2F` (`reverseStrState()`):** Inverted limit switches (`OpenLimit == LOW` → `"CLOSE"`, `CloseLimit == LOW` → `"OPEN"`, else `"TRANSIT"`).
 - **`RTV` (`solStrState()`):** Software-tracked solenoid (`activated == 1` → `"VENTING"`, `activated == -1` → `"FILLING"`, else `"TRANSIT"`).
 
 **What `SerialController` must do:**
