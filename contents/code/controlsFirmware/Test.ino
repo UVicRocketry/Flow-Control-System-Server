@@ -32,6 +32,14 @@
 // ---------------------------------------------------------------------------
 #include "Valve.h"
 
+// ---------------------------------------------------------------------------
+// Servo.h is a built-in Arduino library for PWM servo control.
+// It sends a 50 Hz PWM signal whose pulse width (1000-2000 µs) commands the
+// servo to a position. attach() binds the library to a specific pin; write()
+// sets the angle (0-180°). We use it for the VENT servo on pin D8.
+// ---------------------------------------------------------------------------
+#include <Servo.h>
+
 
 // ===========================================================================
 // PIN DEFINITIONS
@@ -55,7 +63,24 @@
 #define CloseLimitMEV  27
 #define OpenLimitNCV   28
 #define CloseLimitNCV  29
+// DUMP and VENT are limit-switch-only valves (no stepper driver).
+// They report position via limit switches; a solenoid or actuator drives them.
+#define OpenLimitDUMP  22
+#define CloseLimitDUMP 23
+#define OpenLimitVENT  24
+#define CloseLimitVENT 25
 
+// --- VENT servo signal pin ---
+// The VENT valve is a PWM servo on pin D8. The Servo library takes over this
+// pin when attach() is called in setup(). It sends a 50 Hz pulse whose width
+// (1000-2000 µs) commands the servo to a position. write() sets the angle
+// in degrees (0-180). No Step/Dir pins are needed.
+#define VentServoPin   8
+
+// Servo travel positions -- adjust these on the bench to match the physical
+// valve's open and closed stops. 0° and 90° are starting guesses.
+#define VentServoOpen  0    // degrees: valve fully open
+#define VentServoClose 90   // degrees: valve fully closed
 // --- Stepper driver enable pins ---
 // Setting these HIGH disables the driver (motors de-energised).
 // Setting LOW enables it. Currently driven HIGH in Controls.ino setup()
@@ -103,7 +128,14 @@ Valve ERV  = Valve(OpenLimitERV,  CloseLimitERV,  StepERV,  DirERV,  2);
 Valve MEV  = Valve(OpenLimitMEV,  CloseLimitMEV,  StepMEV,  DirMEV,  4);
 Valve NCV  = Valve(OpenLimitNCV,  CloseLimitNCV);            // limit-switch only
 Valve RTV  = Valve(OpenLimitRTV,  CloseLimitRTV,  RTVEnab);  // solenoid
+// DUMP and VENT: limit-switch only -- no stepper pins needed.
+// VENT has a servo on VentServoPin; DUMP has no driver (limit switches only).
+Valve DUMP = Valve(OpenLimitDUMP, CloseLimitDUMP);
+Valve VENT = Valve(OpenLimitVENT, CloseLimitVENT);
 
+// Servo object for the VENT valve.
+// ventServo.attach(pin) must be called in setup() before write() will work.
+Servo ventServo;
 
 // ===========================================================================
 // TARGET STATE VARIABLES
@@ -125,6 +157,8 @@ int TargetMEV  = 0;
 int TargetRTV  = 0;   // RTV: 1 = FILL position, -1 = VENT position
 int TargetNCV  = 0;   // NCV solenoid: 1 = off (closed), -1 = on (open)
 int TargetIG   = 0;   // Igniter: 1 = off (safe), -1 = on (FIRE -- careful!)
+int TargetDUMP = 0;   // DUMP: 1 = closed, -1 = open
+int TargetVENT = 0;   // VENT: 1 = closed, -1 = open
 
 
 // ===========================================================================
@@ -150,12 +184,19 @@ void setup() {
   // after 100 ms so loop() doesn't freeze waiting for more bytes.
   Serial.setTimeout(100);
 
+  // Bind the VENT servo to its pin and start it in the CLOSED position.
+  // write(angle) generates the PWM pulse that commands the servo position.
+  // Starting closed is the safe state for a vent valve.
+  ventServo.attach(VentServoPin);
+  ventServo.write(VentServoClose);
+
   // Print the current valve states immediately so you know the starting
   // condition before you send any commands.
   reportState();
 
   // Remind the developer what commands are available.
   Serial.println("TEST,READY,commands: MCC,CTRL,<VALVE>,<OPEN|CLOSE|FILL|VENT>  MCC,SUMMARY");
+  Serial.println("TEST,READY,valves: N2OV N2OF ERV MEV RTV NCV IGPRIME DUMP VENT");
 }
 
 
@@ -280,6 +321,8 @@ void setOneTarget(String body) {
   else if (valve == "RTV")    { TargetRTV  = dir; }
   else if (valve == "NCV")    { TargetNCV  = dir; }
   else if (valve == "IGPRIME"){ TargetIG   = dir; }
+  else if (valve == "DUMP")   { TargetDUMP = dir; }
+  else if (valve == "VENT")   { TargetVENT = dir; }
   else {
     // Mirror the exact error string Controls.ino sends so test output is
     // indistinguishable from real firmware output.
@@ -369,6 +412,26 @@ void driveValves() {
     if (TargetIG == -1) digitalWrite(Igniter, HIGH);  // igniter on
   }
 
+  // --- DUMP (limit-switch only, no stepper) ---
+  // Like NCV, DUMP has no stepper -- its actuator is driven externally.
+  // We read limit switches via getChange() to detect when it moves, but
+  // we can't command it to move from here. MCC,CTRL,DUMP,OPEN/CLOSE sets
+  // TargetDUMP so the state check below works when it arrives manually.
+  if (DUMP.state() != TargetDUMP && TargetDUMP != 0) {
+    // No moveStep() call -- DUMP has no driver pins.
+    // Target is recorded; operator moves the valve manually or via its actuator.
+  }
+  if (DUMP.getChange()) anyChange = true;
+
+  // --- VENT (PWM servo on VentServoPin via Servo library) ---
+  // ventServo.write() sends the angle immediately; the servo moves on its own.
+  // We read VENT's limit switches via getChange() to detect when it arrives.
+  if (TargetVENT != 0) {
+    if (TargetVENT == -1) ventServo.write(VentServoOpen);   // command open
+    if (TargetVENT ==  1) ventServo.write(VentServoClose);  // command close
+  }
+  if (VENT.getChange()) anyChange = true;
+
   // If any valve reached a limit switch this cycle, print a fresh summary
   // so the state change is visible in the Serial Monitor without extra input.
   if (anyChange) reportState();
@@ -393,5 +456,7 @@ void reportState() {
   Serial.print(",ERV,"  + ERV.strState());
   Serial.print(",MEV,"  + MEV.strState());
   Serial.print(",NCV,"  + NCV.strState());
+  Serial.print(",DUMP," + DUMP.strState());
+  Serial.print(",VENT," + VENT.strState());
   Serial.println("");   // terminate the line
 }

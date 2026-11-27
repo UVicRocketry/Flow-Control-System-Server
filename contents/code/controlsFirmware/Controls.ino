@@ -7,6 +7,7 @@
    Organization: UVic Rocketry
 */
 #include "Valve.h"
+#include <Servo.h>
 
 //*********Limit Pins*********
 #define OpenLimitMEV 30
@@ -25,6 +26,11 @@
 #define CloseLimitDUMP 23
 #define OpenLimitVENT 24
 #define CloseLimitVENT 25
+
+//VENT servo signal pin (PWM, driven via the Servo library)
+#define VentServoPin 8
+#define VentServoOpen 0
+#define VentServoClose 90
 //****************************
 
 //******Enable Pins **********
@@ -57,7 +63,7 @@
 
 
 int IgniterState = 0;
-int TargetState [8];
+int TargetState [10];
 
 void MoveToTarget();
 void setTarget (String valveCommands);
@@ -72,8 +78,9 @@ Valve N2OF  = Valve(OpenLimitN2OF, CloseLimitN2OF, StepN2OF, DirN2OF, 4);
 Valve ERV  = Valve(OpenLimitERV, CloseLimitERV, StepERV, DirERV, 2);
 Valve MEV  = Valve(OpenLimitMEV, CloseLimitMEV, StepMEV, DirMEV, 4);
 
-Valve DUMP = Valve(OpenLimitDUMP, CloseLimitDUMP)
-Valve VENT = Valve(OpenLimitVENT, CloseLimitVENT)
+Valve DUMP = Valve(OpenLimitDUMP, CloseLimitDUMP);
+Valve VENT = Valve(OpenLimitVENT, CloseLimitVENT);
+Servo ventServo;;
 
 //Other Valves
 Valve NCV  = Valve(OpenLimitNCV, CloseLimitNCV);
@@ -113,10 +120,12 @@ void setup() {
 
   Serial.println("VC,STATUS,STARTUP,SUCCESS");
   Serial.println("VC,CF,Initalizing_to_safe_state:(ALL Closed)");
+  ventServo.attach(VentServoPin);
+  ventServo.write(VentServoClose);  // safe state: closed
   sendState();
   delay(1000);
   //Set all target states to closed
-  for(int i = 0; i<8; i++)
+  for(int i = 0; i<10; i++)
   {
     TargetState[i] = 1;
   }
@@ -159,11 +168,13 @@ void loop() {
       //implement abort code
       TargetState[0] = 1;  //Close N2OF
       TargetState[1] = -1; //Open N2OV
-      TargetState[2] = -1; //Open Relief Valve (ERV)
+      TargetState[2] = -1; //Open ERV
       TargetState[3] = 1;  //Close MEV
       TargetState[4] = 1;  //Close RTV
       TargetState[5] = 1;  //Close Igniter
       TargetState[6] = 1;  //Close NCV
+      TargetState[7] = -1; //Open DUMP
+      TargetState[8] = -1; //Open VENT
       
     } else if (TYPE == "CTRL")
     {
@@ -255,10 +266,10 @@ void setTarget (String valveCommands)
     } else if (Label == "NCV")
     {
       index = 6;
-    } else if (Label == "VENT")
+    } else if (Label == "DUMP")
     {
       index = 7;
-    } else if (Label == "DUMP")
+    } else if (Label == "VENT")
     {
       index = 8;
     } else
@@ -325,31 +336,30 @@ void MoveToTarget()
     sendState();
   }
 
-  '''
   if (RTV.solState() != TargetState[4] && TargetState[4]!=0)
   {
-    RTV.moveSol(TargetState[4]);   
-    sendState();     
+    RTV.moveSol(TargetState[4]);
+    sendState();
   }
-  '''
-  if (IgniterState != TargetState[4] && TargetState[4]!=0)
+
+  if (IgniterState != TargetState[5] && TargetState[5]!=0)
   {
-    if (TargetState[4] == 1)
+    if (TargetState[5] == 1)
     {
       digitalWrite(Igniter, LOW);
       IgniterState = 1;
-    } else if (TargetState[4] == -1) {
+    } else if (TargetState[5] == -1) {
       digitalWrite(Igniter, HIGH);
       IgniterState = -1;
     }
   }
 
-  if (NCV.state() != TargetState[5] && TargetState[5]!=0)
+  if (NCV.state() != TargetState[6] && TargetState[6]!=0)
   {
-    if (TargetState[5] == 1)
+    if (TargetState[6] == 1)
     {
       digitalWrite(Solenoid, LOW);
-    } else if (TargetState[5] == -1)
+    } else if (TargetState[6] == -1)
     {
       digitalWrite(Solenoid, HIGH);
     }
@@ -358,19 +368,23 @@ void MoveToTarget()
   {
     sendState();
   }
-  if (VENT.state() != TargetState[6] && TargetState[6]!=0)
-  {
-    VENT.moveStep(-TargetState[6]);
-  }
-  if ( DUMP.getChange())
-  {
-    sendState();
-  }
+
   if (DUMP.state() != TargetState[7] && TargetState[7]!=0)
   {
     DUMP.moveStep(-TargetState[7]);
   }
   if (DUMP.getChange())
+  {
+    sendState();
+  }
+
+  if (VENT.state() != TargetState[8] && TargetState[8]!=0)
+  {
+    // VENT is a PWM servo, not a stepper -- command the angle directly.
+    if (TargetState[8] == 1)  ventServo.write(VentServoClose);
+    if (TargetState[8] == -1) ventServo.write(VentServoOpen);
+  }
+  if (VENT.getChange())
   {
     sendState();
   }
